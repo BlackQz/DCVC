@@ -195,29 +195,30 @@ def create_rgb_config(
 
 def create_existing_split_view(args: argparse.Namespace, input_root: Path, work_root: Path) -> None:
     train_root = input_root / args.train_dir_name
-    test_root = input_root / args.test_dir_name
+    val_dir_name = args.val_dir_name or args.test_dir_name
+    val_root = input_root / val_dir_name
     if not train_root.exists():
         raise FileNotFoundError(f"train split not found: {train_root}")
-    if not test_root.exists():
-        raise FileNotFoundError(f"test split not found: {test_root}")
+    if not val_root.exists():
+        raise FileNotFoundError(f"val split not found: {val_root}")
 
     train_seqs = discover_png_dirs(train_root, args.width, args.height)
-    test_seqs = discover_png_dirs(test_root, args.width, args.height)
+    val_seqs = discover_png_dirs(val_root, args.width, args.height)
     if not train_seqs:
         raise FileNotFoundError(f"no PNG sequence folders found under {train_root}")
-    if not test_seqs:
-        raise FileNotFoundError(f"no PNG sequence folders found under {test_root}")
+    if not val_seqs:
+        raise FileNotFoundError(f"no PNG sequence folders found under {val_root}")
 
     config_dir = work_root / "configs"
     official_root = work_root / "official_rgb"
-    official_test = official_root / args.test_dir_name
-    if args.overwrite and official_test.exists():
-        shutil.rmtree(official_test)
-    official_test.mkdir(parents=True, exist_ok=True)
+    official_val = official_root / val_dir_name
+    if args.overwrite and official_val.exists():
+        shutil.rmtree(official_val)
+    official_val.mkdir(parents=True, exist_ok=True)
 
     standardized = []
-    for seq in test_seqs:
-        dst_dir = official_test / seq["name"]
+    for seq in val_seqs:
+        dst_dir = official_val / seq["name"]
         frame_count = standardize_png_dir(seq, dst_dir, args.split_mode, args.max_frames)
         standardized.append({
             "name": seq["name"],
@@ -231,7 +232,7 @@ def create_existing_split_view(args: argparse.Namespace, input_root: Path, work_
         official_root,
         standardized,
         args.eval_frames,
-        base_path=args.test_dir_name,
+        base_path=val_dir_name,
     )
     manifest = {
         "input_root": str(input_root),
@@ -240,11 +241,11 @@ def create_existing_split_view(args: argparse.Namespace, input_root: Path, work_
         "width": args.width,
         "height": args.height,
         "train_dir": str(train_root),
-        "test_dir": str(test_root),
+        "val_dir": str(val_root),
         "train_sequences": [s["name"] for s in train_seqs],
-        "test_sequences": [s["name"] for s in standardized],
+        "val_sequences": [s["name"] for s in standardized],
         "train_video_count": len(train_seqs),
-        "test_video_count": len(standardized),
+        "val_video_count": len(standardized),
         "official_rgb_root": str(official_root),
         "rgb_config": str((config_dir / "bvidvc512_rgb.json").resolve()),
     }
@@ -354,9 +355,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--work_root", required=True, help="output root for frame splits and configs")
     p.add_argument("--source_type", choices=["auto", "yuv", "png"], default="auto")
     p.add_argument("--existing_split", action="store_true",
-                   help="input_root already contains train/ and test/ PNG sequence folders")
+                   help="input_root already contains train/ and val/ PNG sequence folders")
     p.add_argument("--train_dir_name", type=str, default="train")
-    p.add_argument("--test_dir_name", type=str, default="test")
+    p.add_argument("--val_dir_name", type=str, default="val")
+    p.add_argument("--test_dir_name", type=str, default="",
+                   help="legacy alias used only when --val_dir_name is empty")
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--bit_depth", type=int, default=8)

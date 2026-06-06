@@ -9,7 +9,7 @@
 │   │   ├── *.png
 │   │   └── ...
 │   └── ...
-├── test/
+├── val/
 │   ├── video_folder_xxx/
 │   │   ├── *.png
 │   │   └── ...
@@ -22,17 +22,17 @@
 - 图像尺寸：`512x512`；
 - 已经中心裁剪为 512；
 - `train_videos=3592`；
-- `val_videos=408`，实际目录名为 `test`；
+- `val_videos=408`，实际目录名为 `val`；
 - 每个 crop 视频约 `64` 帧；
-- 数据已经完成 train/test 划分，不需要重新随机划分。
+- 数据已经完成 train/val 划分，不需要重新随机划分。
 
 因此后续方案固定为：
 
 - 训练数据：`/data/sdb/bitqzh/data/BVI-DVC-512/train`；
-- 验证/测试数据：`/data/sdb/bitqzh/data/BVI-DVC-512/test`；
+- 验证/测试数据：`/data/sdb/bitqzh/data/BVI-DVC-512/val`；
 - 训练裁剪：`256x256`；
 - 正式评估：`512x512`；
-- 官方 DCVC-FM baseline：使用 test split 的 PNG 配置；
+- 官方 DCVC-FM baseline：使用 val split 的 PNG 配置；
 - 卫星模型正式 checkpoint：使用 `best.pt`。
 
 ## 总运行顺序
@@ -76,7 +76,7 @@ ls checkpoints/cvpr2024_video.pth.tar
 ```bash
 ls /data/sdb/bitqzh/data/BVI-DVC-512
 ls /data/sdb/bitqzh/data/BVI-DVC-512/train | head
-ls /data/sdb/bitqzh/data/BVI-DVC-512/test | head
+ls /data/sdb/bitqzh/data/BVI-DVC-512/val | head
 ```
 
 建议编译 motion compensation CUDA 扩展，避免 fallback 到慢速 `grid_sample`：
@@ -91,7 +91,7 @@ cd ../../..
 
 ## 2. 生成官方测试 config
 
-你的数据已经是 PNG 帧目录，但 DCVC-FM 官方 `test_video.py` 的 `PNGReader` 要求帧名是 `im00001.png` 或 `im1.png`。为了避免原始 PNG 命名不兼容，使用下面脚本生成一个标准命名的 test symlink 视图和官方 RGB config。
+你的数据已经是 PNG 帧目录，但 DCVC-FM 官方 `test_video.py` 的 `PNGReader` 要求帧名是 `im00001.png` 或 `im1.png`。为了避免原始 PNG 命名不兼容，使用下面脚本生成一个标准命名的 val symlink 视图和官方 RGB config。
 
 运行：
 
@@ -102,7 +102,7 @@ python tools/prepare_bvidvc512.py \
   --source_type png \
   --existing_split \
   --train_dir_name train \
-  --test_dir_name test \
+  --val_dir_name val \
   --width 512 \
   --height 512 \
   --eval_frames 64 \
@@ -117,7 +117,7 @@ python tools/prepare_bvidvc512.py \
 ├── configs/
 │   └── bvidvc512_rgb.json
 ├── official_rgb/
-│   └── test/
+│   └── val/
 │       ├── video_folder_xxx/
 │       │   ├── im00001.png -> 原始 PNG
 │       │   └── ...
@@ -127,14 +127,14 @@ python tools/prepare_bvidvc512.py \
 
 说明：
 
-- 这一步不会重新划分 train/test；
+- 这一步不会重新划分 train/val；
 - 训练仍直接使用原始 `/data/sdb/bitqzh/data/BVI-DVC-512`；
-- `official_rgb/test` 只给官方 `test_video.py` 用；
+- `official_rgb/val` 只给官方 `test_video.py` 用；
 - `eval_frames=64` 与 `metadata.json` 中每个视频 64 帧一致。
 
 ## 3. 跑 DCVC-FM 官方 baseline
 
-这一步用于确认官方 DCVC-FM 权重在你的 BVI-DVC-512 test split 上正常。不要使用 `dataset_config_example_yuv420.json`，它指向 UVG/HEVC 示例路径。
+这一步用于确认官方 DCVC-FM 权重在你的 BVI-DVC-512 val split 上正常。不要使用 `dataset_config_example_yuv420.json`，它指向 UVG/HEVC 示例路径。
 
 运行：
 
@@ -255,7 +255,7 @@ final.pt
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m training.evaluate_dcvcfm_satellite_suite \
-  --data_dir /data/sdb/bitqzh/data/BVI-DVC-512/test \
+  --data_dir /data/sdb/bitqzh/data/BVI-DVC-512/val \
   --ckpt checkpoints/dcvcfm_satellite_curriculum/05_joint_finetune/best.pt \
   --model_path_i checkpoints/cvpr2024_image.pth.tar \
   --model_path_p checkpoints/cvpr2024_video.pth.tar \
@@ -363,7 +363,7 @@ plr/plr_0.5
 
 ### 为什么还要运行 prepare 脚本？
 
-不是为了重新划分数据，而是为了给 DCVC-FM 官方 `test_video.py` 生成兼容 config，并创建 `im00001.png` 标准命名 symlink。卫星训练脚本直接读取原始 `train/test`，不依赖这个 symlink 目录。
+不是为了重新划分数据，而是为了给 DCVC-FM 官方 `test_video.py` 生成兼容 config，并创建 `im00001.png` 标准命名 symlink。卫星训练脚本直接读取原始 `train/val`，不依赖这个 symlink 目录。
 
 ### 找不到 UVG 文件
 

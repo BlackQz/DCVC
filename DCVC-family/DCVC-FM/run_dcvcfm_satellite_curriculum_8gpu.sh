@@ -87,10 +87,10 @@ ADAPTER_DECAY=$(scale_steps 60000)
 echo "[DCVC-FM-SAT] NGPU=$NGPU per-rank steps: slot=$SLOT_S selection=$SEL_S capacity=$CAP_S robust=$ROB_S joint=$JOINT_S"
 echo "[DCVC-FM-SAT] checkpoints: $OUT_ROOT"
 echo "[DCVC-FM-SAT] train crop: ${TRAIN_IMG_H}x${TRAIN_IMG_W}; eval frame: ${EVAL_IMG_H}x${EVAL_IMG_W}"
-if [[ -d "$DATA_ROOT/test" ]]; then
-  EVAL_DATA_DIR="$DATA_ROOT/test"
-elif [[ -d "$DATA_ROOT/val" ]]; then
+if [[ -d "$DATA_ROOT/val" ]]; then
   EVAL_DATA_DIR="$DATA_ROOT/val"
+elif [[ -d "$DATA_ROOT/test" ]]; then
+  EVAL_DATA_DIR="$DATA_ROOT/test"
 else
   EVAL_DATA_DIR="$DATA_ROOT"
 fi
