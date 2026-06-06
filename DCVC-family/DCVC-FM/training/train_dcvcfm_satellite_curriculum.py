@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 import random
 import sys
@@ -16,8 +17,10 @@ import time
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -48,6 +51,55 @@ from training.train_dcvcfm_satellite import (  # noqa: E402
 LOGGER = logging.getLogger("train_dcvcfm_satellite_curriculum")
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def init_distributed(args: argparse.Namespace) -> tuple[bool, int, int, int]:
+    """Initialise torch.distributed when launched via torchrun.
+
+    Returns ``(distributed, rank, world_size, local_rank)``.  When the process
+    is not launched with ``WORLD_SIZE>1`` this is a no-op and the single-GPU
+    code path is preserved byte-for-byte.
+    """
+    world_size = _env_int("WORLD_SIZE", 1)
+    rank = _env_int("RANK", 0)
+    local_rank = _env_int("LOCAL_RANK", 0)
+    if world_size <= 1:
+        return False, 0, 1, 0
+    use_cuda = torch.cuda.is_available() and args.device != "cpu"
+    backend = "nccl" if use_cuda else "gloo"
+    dist.init_process_group(backend=backend, init_method="env://")
+    if use_cuda:
+        torch.cuda.set_device(local_rank)
+    return True, rank, world_size, local_rank
+
+
+def broadcast_module(model: torch.nn.Module) -> None:
+    """Broadcast all parameters/buffers from rank 0 so every replica starts identical."""
+    for tensor in model.state_dict().values():
+        if torch.is_tensor(tensor):
+            dist.broadcast(tensor, src=0)
+
+
+def average_gradients(params: list[torch.nn.Parameter], world_size: int) -> None:
+    """Average gradients across replicas (manual DDP suited to the custom forward loop).
+
+    Every rank must launch the all-reduce for the *same* parameters in the *same*
+    order, otherwise a parameter that is used on one rank but not another (the
+    selection masks are data-dependent) would dead-lock the collective.  We
+    therefore materialise a zero gradient for any param that did not receive one.
+    """
+    for p in params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        p.grad /= world_size
+
+
 def set_phase_defaults(args: argparse.Namespace) -> None:
     spec = get_phase_spec(args.phase)
     args.stage = spec.stage_alias
@@ -65,10 +117,37 @@ def set_phase_defaults(args: argparse.Namespace) -> None:
         args.lambda_channel = max(args.lambda_channel, 0.05)
 
 
-def build_loaders(args: argparse.Namespace, device: torch.device) -> tuple[DataLoader, DataLoader | None]:
+def update_learning_rate(optimizer: torch.optim.Optimizer, args: argparse.Namespace, step: int) -> float:
+    """Apply the Slot-Attention-style warmup and exponential decay schedule."""
+
+    lr = float(args.lr)
+    if args.lr_warmup_steps > 0:
+        lr *= min(1.0, float(step) / float(args.lr_warmup_steps))
+    if args.lr_decay_steps > 0 and args.lr_decay_rate > 0:
+        lr *= float(args.lr_decay_rate) ** (float(step) / float(args.lr_decay_steps))
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
+
+
+def build_loaders(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+) -> tuple[DataLoader, DataLoader | None, DistributedSampler | None]:
     data_root = Path(args.data_dir)
     train_root = data_root / "train" if (data_root / "train").exists() else data_root
-    val_root = Path(args.val_dir) if args.val_dir else (data_root / "val")
+    if args.val_dir:
+        val_root = Path(args.val_dir)
+    elif (data_root / "val").exists():
+        val_root = data_root / "val"
+    elif (data_root / "test").exists():
+        val_root = data_root / "test"
+    else:
+        val_root = data_root / "val"
 
     train_ds = VideoFolderDataset(
         train_root,
@@ -78,10 +157,18 @@ def build_loaders(args: argparse.Namespace, device: torch.device) -> tuple[DataL
         max_clips=args.max_train_clips,
         random_crop=True,
     )
+    train_sampler: DistributedSampler | None = None
+    if distributed:
+        # drop_last keeps every replica at an identical batch count, which keeps
+        # the manual all-reduce / validation barriers perfectly in lock-step.
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
+        )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         drop_last=True,
@@ -104,7 +191,7 @@ def build_loaders(args: argparse.Namespace, device: torch.device) -> tuple[DataL
             num_workers=args.num_workers,
             pin_memory=device.type == "cuda",
         )
-    return train_loader, val_loader
+    return train_loader, val_loader, train_sampler
 
 
 def slot_warmup_loss(model, clip: torch.Tensor, args: argparse.Namespace) -> tuple[torch.Tensor, dict[str, float], dict[str, Any]]:
@@ -235,19 +322,40 @@ def log_validation_summary(summary: dict[str, Any]) -> None:
 
 def train(args: argparse.Namespace) -> None:
     set_phase_defaults(args)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    distributed, rank, world_size, local_rank = init_distributed(args)
+    is_main = rank == 0
+    logging.basicConfig(
+        level=logging.INFO if is_main else logging.WARNING,
+        format=f"%(asctime)s %(levelname)s [rank{rank}] %(message)s",
+    )
+    if distributed and torch.cuda.is_available() and args.device != "cpu":
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    # Identical seed across replicas -> identical model init; the DistributedSampler
+    # handles per-rank data sharding instead of seed offsets.
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+    if distributed:
+        LOGGER.info("distributed run: world_size=%d rank=%d local_rank=%d device=%s", world_size, rank, local_rank, device)
+        if args.amp and not args.no_amp:
+            raise RuntimeError("multi-GPU curriculum training keeps AMP disabled; remove --amp for torchrun runs")
 
     spec = get_phase_spec(args.phase)
     save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    (save_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
-    (save_dir / "phase.json").write_text(json.dumps(spec.__dict__, indent=2), encoding="utf-8")
+    if is_main:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        (save_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+        (save_dir / "phase.json").write_text(json.dumps(spec.__dict__, indent=2), encoding="utf-8")
+    if distributed:
+        dist.barrier()
 
-    train_loader, val_loader = build_loaders(args, device)
+    train_loader, val_loader, train_sampler = build_loaders(
+        args, device, distributed=distributed, rank=rank, world_size=world_size
+    )
     model = build_model(args, device)
+    if distributed:
+        broadcast_module(model)
     params = configure_trainable_parameters(model, args.phase)
     LOGGER.info("phase=%s | %s", spec.name, spec.description)
     LOGGER.info("channel_type=%s trainable_params=%d", args.channel_type, sum(p.numel() for p in params))
@@ -255,30 +363,42 @@ def train(args: argparse.Namespace) -> None:
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay) if params else None
     conditions = parse_val_conditions(args.val_conditions)
 
-    best_score, init_summary = validate_for_phase(model, val_loader, args=args, conditions=conditions, device=device)
-    save_checkpoint(
-        save_dir / "best.pt",
-        model=model,
-        args=args,
-        step=0,
-        epoch=0,
-        best_score=best_score,
-        extra={"phase": spec.__dict__, "initial_validation": init_summary},
-    )
-    LOGGER.info("saved initial best baseline: %s | score=%.5f", save_dir / "best.pt", best_score)
-    log_validation_summary(init_summary)
-
-    if args.phase == "baseline" or args.max_steps == 0:
+    if is_main:
+        best_score, init_summary = validate_for_phase(model, val_loader, args=args, conditions=conditions, device=device)
         save_checkpoint(
-            save_dir / "final.pt",
+            save_dir / "best.pt",
             model=model,
             args=args,
             step=0,
             epoch=0,
             best_score=best_score,
-            extra={"phase": spec.__dict__},
+            extra={"phase": spec.__dict__, "initial_validation": init_summary},
         )
-        LOGGER.info("baseline/eval-only run complete.")
+        LOGGER.info("saved initial best baseline: %s | score=%.5f", save_dir / "best.pt", best_score)
+        log_validation_summary(init_summary)
+    else:
+        best_score = float("inf")
+    if distributed:
+        score_t = torch.tensor([best_score], dtype=torch.float64, device=device)
+        dist.broadcast(score_t, src=0)
+        best_score = float(score_t.item())
+        dist.barrier()
+
+    if args.phase == "baseline" or args.max_steps == 0:
+        if is_main:
+            save_checkpoint(
+                save_dir / "final.pt",
+                model=model,
+                args=args,
+                step=0,
+                epoch=0,
+                best_score=best_score,
+                extra={"phase": spec.__dict__},
+            )
+            LOGGER.info("baseline/eval-only run complete.")
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
         return
     if optimizer is None:
         raise RuntimeError(f"phase {args.phase} has no trainable parameters")
@@ -289,11 +409,14 @@ def train(args: argparse.Namespace) -> None:
     last_epoch = 0
     for epoch in range(1, args.epochs + 1):
         last_epoch = epoch
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
         for clip in train_loader:
             global_step += 1
             begin = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
+            current_lr = update_learning_rate(optimizer, args, global_step)
 
             if args.phase == "slot_warmup":
                 clip = clip.to(device, non_blocking=True)
@@ -320,13 +443,17 @@ def train(args: argparse.Namespace) -> None:
                     "check phase trainability and differentiable masks"
                 )
             scaler.scale(loss).backward()
+            if distributed:
+                # Average gradients of the (scaled) loss across replicas; the scale
+                # is identical on every rank so unscaling afterwards stays correct.
+                average_gradients(params, world_size)
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
 
-            if global_step % args.log_interval == 0:
+            if is_main and global_step % args.log_interval == 0:
                 elapsed_ms = (time.perf_counter() - begin) * 1000.0
                 LOGGER.info(
                     "phase=%s step=%d loss=%.5f recon=%.5f rate=%.5f mono=%.5f ch=%.5f "
@@ -351,25 +478,33 @@ def train(args: argparse.Namespace) -> None:
                     logs.get("proc_ms", 0.0),
                     elapsed_ms,
                 )
+                LOGGER.info("lr=%.8f", current_lr)
 
             if val_loader is not None and args.val_interval > 0 and global_step % args.val_interval == 0:
-                score, summary = validate_for_phase(model, val_loader, args=args, conditions=conditions, device=device)
-                log_validation_summary(summary)
-                if score < best_score:
-                    best_score = score
-                    save_checkpoint(
-                        save_dir / "best.pt",
-                        model=model,
-                        args=args,
-                        step=global_step,
-                        epoch=epoch,
-                        best_score=best_score,
-                        extra={"phase": spec.__dict__, "validation": summary},
-                    )
-                    LOGGER.info("new best saved: score=%.5f", best_score)
+                # All ranks reach the same step (DistributedSampler keeps batch counts
+                # equal); only rank 0 evaluates while the others wait on the barriers.
+                if distributed:
+                    dist.barrier()
+                if is_main:
+                    score, summary = validate_for_phase(model, val_loader, args=args, conditions=conditions, device=device)
+                    log_validation_summary(summary)
+                    if score < best_score:
+                        best_score = score
+                        save_checkpoint(
+                            save_dir / "best.pt",
+                            model=model,
+                            args=args,
+                            step=global_step,
+                            epoch=epoch,
+                            best_score=best_score,
+                            extra={"phase": spec.__dict__, "validation": summary},
+                        )
+                        LOGGER.info("new best saved: score=%.5f", best_score)
                 model.train()
+                if distributed:
+                    dist.barrier()
 
-            if args.save_interval > 0 and global_step % args.save_interval == 0:
+            if is_main and args.save_interval > 0 and global_step % args.save_interval == 0:
                 save_checkpoint(
                     save_dir / f"step_{global_step:07d}.pt",
                     model=model,
@@ -384,16 +519,20 @@ def train(args: argparse.Namespace) -> None:
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
 
-    save_checkpoint(
-        save_dir / "final.pt",
-        model=model,
-        args=args,
-        step=global_step,
-        epoch=last_epoch,
-        best_score=best_score,
-        extra={"phase": spec.__dict__},
-    )
-    LOGGER.info("training complete: final=%s best=%s best_score=%.5f", save_dir / "final.pt", save_dir / "best.pt", best_score)
+    if is_main:
+        save_checkpoint(
+            save_dir / "final.pt",
+            model=model,
+            args=args,
+            step=global_step,
+            epoch=last_epoch,
+            best_score=best_score,
+            extra={"phase": spec.__dict__},
+        )
+        LOGGER.info("training complete: final=%s best=%s best_score=%.5f", save_dir / "final.pt", save_dir / "best.pt", best_score)
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def parse_args() -> argparse.Namespace:
@@ -421,6 +560,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--max_steps", type=int, default=10000)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr_warmup_steps", type=int, default=0,
+                   help="linear warmup steps; follows the official Slot Attention schedule when >0")
+    p.add_argument("--lr_decay_steps", type=int, default=0,
+                   help="exponential decay denominator; disabled when <=0")
+    p.add_argument("--lr_decay_rate", type=float, default=1.0,
+                   help="exponential decay rate, e.g. 0.5 as in official Slot Attention")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true", help="enable CUDA AMP; fp32 is default for entropy stability")

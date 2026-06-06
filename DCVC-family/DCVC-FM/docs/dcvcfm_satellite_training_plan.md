@@ -1,320 +1,406 @@
-# DCVC-FM Satellite Curriculum Training Plan
+# BVI-DVC-512 训练与测试顺序方案
 
-This is the recommended training and testing plan for the satellite-aware
-DCVC-FM model.  It replaces the coarse A/B/C recipe for main experiments while
-keeping the original DCVC-FM codec and bitstream path independently runnable.
+本文档是当前项目唯一推荐方案。它针对你现有的数据结构：
 
-## Why This Curriculum
+```text
+/data/sdb/bitqzh/data/BVI-DVC-512/
+├── train/
+│   ├── video_folder_001/
+│   │   ├── *.png
+│   │   └── ...
+│   └── ...
+├── test/
+│   ├── video_folder_xxx/
+│   │   ├── *.png
+│   │   └── ...
+│   └── ...
+└── metadata.json
+```
 
-The satellite model has three learning problems that should not be optimized
-from scratch at the same time:
+从你给出的 `metadata.json` 可知：
 
-- object discovery: Slot Attention must first learn stable masks and slot
-  embeddings from video frames;
-- semantic selection: residual magnitude, novelty, object importance, and
-  temporal uncertainty must learn how to rank latent positions;
-- channel robustness: base/enhancement latents must survive SNR, bandwidth, and
-  packet-loss variation without forcing every condition to a low-rate solution.
+- 图像尺寸：`512x512`；
+- 已经中心裁剪为 512；
+- `train_videos=3592`；
+- `val_videos=408`，实际目录名为 `test`；
+- 每个 crop 视频约 `64` 帧；
+- 数据已经完成 train/test 划分，不需要重新随机划分。
 
-The curriculum separates these problems, then reconnects them for final
-low-learning-rate tuning.
+因此后续方案固定为：
+
+- 训练数据：`/data/sdb/bitqzh/data/BVI-DVC-512/train`；
+- 验证/测试数据：`/data/sdb/bitqzh/data/BVI-DVC-512/test`；
+- 训练裁剪：`256x256`；
+- 正式评估：`512x512`；
+- 官方 DCVC-FM baseline：使用 test split 的 PNG 配置；
+- 卫星模型正式 checkpoint：使用 `best.pt`。
+
+## 总运行顺序
+
+必须按下面顺序执行：
 
 ```mermaid
-flowchart LR
-    A["Pure DCVC-FM Baseline"] --> B["Slot Warmup"]
-    B --> C["Selection Warmup<br/>identity channel"]
-    C --> D["Capacity Calibration<br/>paired bandwidths"]
-    D --> E["Robust Curriculum<br/>satellite channel"]
-    E --> F["Joint Finetune<br/>small LR"]
-    F --> G["Formal Suite Eval<br/>best.pt"]
+flowchart TD
+    A["1. 检查环境、权重、数据目录"] --> B["2. 生成 BVI-DVC-512 官方测试 config"]
+    B --> C["3. 跑 DCVC-FM 官方 baseline"]
+    C --> D["4. 先跑卫星模型冒烟测试"]
+    D --> E["5. 跑完整 1-8 卡课程训练"]
+    E --> F["6. 单独重跑正式 suite 测试"]
+    F --> G["7. 对比官方 baseline 与卫星模型结果"]
 ```
 
-## Phase 0: Baseline Check
+## 1. 检查环境、权重、数据
 
-Goal: verify that the wrapper can reproduce the original DCVC-FM path when the
-satellite branch is disabled.
-
-Trainable parameters: none.
-
-Command:
+进入项目：
 
 ```bash
-cd DCVC-family/DCVC-FM
-python -m training.train_dcvcfm_satellite_curriculum \
-  --phase baseline \
-  --data_dir /path/to/frame_dataset \
-  --model_path_i checkpoints/cvpr2024_image.pth.tar \
-  --model_path_p checkpoints/cvpr2024_video.pth.tar \
-  --save_dir checkpoints/dcvcfm_satellite_curriculum/00_baseline \
-  --max_steps 0
+cd ~/FM/DCVC/DCVC-family/DCVC-FM
+conda activate Page1
 ```
 
-Expected result: `best.pt` and `final.pt` are saved, and validation reports
-`keep_ratio=1`, `base_layer_ratio=1`, `enhancement_layer_ratio=0`.
+检查 GPU：
 
-## Phase 1: Slot Warmup
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"
+```
 
-Goal: train the Slot Attention adapter before it controls any DCVC latent.
+检查官方 DCVC-FM 权重：
 
-Trainable parameters: `slot_adapter` only.  The Slot Attention implementation is
-the PyTorch compatibility layer of the official Slot Attention code located at
-`DCVC-family/slot-attention/model.py`; it is not a newly invented slot module.
+```bash
+ls checkpoints/cvpr2024_image.pth.tar
+ls checkpoints/cvpr2024_video.pth.tar
+```
 
-Loss:
+检查数据目录：
+
+```bash
+ls /data/sdb/bitqzh/data/BVI-DVC-512
+ls /data/sdb/bitqzh/data/BVI-DVC-512/train | head
+ls /data/sdb/bitqzh/data/BVI-DVC-512/test | head
+```
+
+建议编译 motion compensation CUDA 扩展，避免 fallback 到慢速 `grid_sample`：
+
+```bash
+cd src/models/extensions
+python setup.py build_ext --inplace
+cd ../../..
+```
+
+如果这里失败，模型仍可运行，只是速度明显变慢。
+
+## 2. 生成官方测试 config
+
+你的数据已经是 PNG 帧目录，但 DCVC-FM 官方 `test_video.py` 的 `PNGReader` 要求帧名是 `im00001.png` 或 `im1.png`。为了避免原始 PNG 命名不兼容，使用下面脚本生成一个标准命名的 test symlink 视图和官方 RGB config。
+
+运行：
+
+```bash
+python tools/prepare_bvidvc512.py \
+  --input_root /data/sdb/bitqzh/data/BVI-DVC-512 \
+  --work_root /data/sdb/bitqzh/data/BVI-DVC-512_dcvcfm \
+  --source_type png \
+  --existing_split \
+  --train_dir_name train \
+  --test_dir_name test \
+  --width 512 \
+  --height 512 \
+  --eval_frames 64 \
+  --split_mode symlink \
+  --overwrite
+```
+
+输出：
 
 ```text
-L_slot =
-  lambda_slot * (image_reconstruction + mask_entropy + mask_balance)
-+ lambda_slot_temporal * object_importance_temporal_stability
+/data/sdb/bitqzh/data/BVI-DVC-512_dcvcfm/
+├── configs/
+│   └── bvidvc512_rgb.json
+├── official_rgb/
+│   └── test/
+│       ├── video_folder_xxx/
+│       │   ├── im00001.png -> 原始 PNG
+│       │   └── ...
+│       └── ...
+└── manifest.json
 ```
 
-Command:
+说明：
+
+- 这一步不会重新划分 train/test；
+- 训练仍直接使用原始 `/data/sdb/bitqzh/data/BVI-DVC-512`；
+- `official_rgb/test` 只给官方 `test_video.py` 用；
+- `eval_frames=64` 与 `metadata.json` 中每个视频 64 帧一致。
+
+## 3. 跑 DCVC-FM 官方 baseline
+
+这一步用于确认官方 DCVC-FM 权重在你的 BVI-DVC-512 test split 上正常。不要使用 `dataset_config_example_yuv420.json`，它指向 UVG/HEVC 示例路径。
+
+运行：
 
 ```bash
-python -m training.train_dcvcfm_satellite_curriculum \
-  --phase slot_warmup \
-  --channel_type identity \
-  --data_dir /path/to/frame_dataset \
+mkdir -p results
+
+python test_video.py \
   --model_path_i checkpoints/cvpr2024_image.pth.tar \
   --model_path_p checkpoints/cvpr2024_video.pth.tar \
-  --save_dir checkpoints/dcvcfm_satellite_curriculum/01_slot_warmup \
-  --lr 2e-4 \
-  --max_steps 30000
+  --rate_num 4 \
+  --test_config /data/sdb/bitqzh/data/BVI-DVC-512_dcvcfm/configs/bvidvc512_rgb.json \
+  --cuda 1 \
+  --worker 1 \
+  --write_stream 0 \
+  --output_path results/bvidvc512_dcvcfm_official_rgb.json \
+  --force_intra_period 9999 \
+  --force_frame_num 64
 ```
 
-Validation gate: slot reconstruction PSNR should improve, mask entropy should
-not collapse to one slot, and masks should visibly correspond to object or
-region structure on held-out clips.
-
-## Phase 2: Selection Warmup
-
-Goal: train Slot/Token/Capacity adapters with no channel corruption so the
-selector learns useful differentiable latent ranking.
-
-Trainable parameters: Slot Attention adapter, token selector, capacity
-controller offsets, and slot-to-latent FiLM.  DCVC-FM backbone is frozen.
-
-Channel: `identity`.
-
-Condition sampling: random bandwidth from `1,2,5,10,20,25 Mbps`, high SNR,
-zero PLR.
-
-Command:
+如果你想用多 GPU 加速官方 baseline：
 
 ```bash
-python -m training.train_dcvcfm_satellite_curriculum \
-  --phase selection_warmup \
-  --channel_type identity \
-  --resume checkpoints/dcvcfm_satellite_curriculum/01_slot_warmup/best.pt \
-  --data_dir /path/to/frame_dataset \
+CUDA_VISIBLE_DEVICES=0,1,2,3 python test_video.py \
   --model_path_i checkpoints/cvpr2024_image.pth.tar \
   --model_path_p checkpoints/cvpr2024_video.pth.tar \
-  --save_dir checkpoints/dcvcfm_satellite_curriculum/02_selection_warmup \
-  --lr 1e-4 \
-  --max_steps 50000
+  --rate_num 4 \
+  --test_config /data/sdb/bitqzh/data/BVI-DVC-512_dcvcfm/configs/bvidvc512_rgb.json \
+  --cuda 1 \
+  --worker 4 \
+  --write_stream 0 \
+  --output_path results/bvidvc512_dcvcfm_official_rgb.json \
+  --force_intra_period 9999 \
+  --force_frame_num 64
 ```
 
-Validation gate: high-bandwidth conditions should not lose much quality versus
-baseline, and low-bandwidth conditions should reduce enhancement usage first.
-
-## Phase 3: Capacity Calibration
-
-Goal: prevent the model from learning "always save bitrate" by training paired
-bandwidth samples in the same optimization step.
-
-Trainable parameters: same as Phase 2.
-
-Channel: `identity`.
-
-Condition construction: each clip is repeated over `1,2,5,10,20,25 Mbps` at
-`SNR=20 dB`, `PLR=0`.
-
-Extra loss:
-
-```text
-L_mono = ReLU(bpp_low - bpp_high) + ReLU(keep_low - keep_high)
-```
-
-Command:
+成功后检查：
 
 ```bash
-python -m training.train_dcvcfm_satellite_curriculum \
-  --phase capacity_calibration \
-  --channel_type identity \
-  --resume checkpoints/dcvcfm_satellite_curriculum/02_selection_warmup/best.pt \
-  --data_dir /path/to/frame_dataset \
-  --model_path_i checkpoints/cvpr2024_image.pth.tar \
-  --model_path_p checkpoints/cvpr2024_video.pth.tar \
-  --save_dir checkpoints/dcvcfm_satellite_curriculum/03_capacity_calibration \
-  --lr 8e-5 \
-  --lambda_monotonic 0.5 \
-  --max_steps 30000
+ls results/bvidvc512_dcvcfm_official_rgb.json
 ```
 
-Validation gate: bandwidth scan should have near-monotonic `bpp` and
-`keep_ratio`; BW25/BW1 bpp ratio should ideally exceed `2.5`.
+这一步成功后再训练卫星模型。
 
-## Phase 4: Robust Curriculum
+## 4. 先跑卫星模型冒烟测试
 
-Goal: train the frozen-backbone adapter path under actual satellite impairments.
+目的：确认数据读取、checkpoint 保存、多阶段串联、正式测试入口都能跑通。先用很少 step，不追求质量。
 
-Trainable parameters: same as Phase 2.
-
-Channel: `satellite`.
-
-Condition sampling: SNR/PLR range is widened during training.  Early steps use
-moderate conditions, late steps sample the full range:
-
-- SNR: progressively down to `1 dB`;
-- bandwidth: `1-25 Mbps`;
-- PLR: progressively up to `0.5`.
-
-Command:
+单卡冒烟：
 
 ```bash
-python -m training.train_dcvcfm_satellite_curriculum \
-  --phase robust_curriculum \
-  --channel_type satellite \
-  --resume checkpoints/dcvcfm_satellite_curriculum/03_capacity_calibration/best.pt \
-  --data_dir /path/to/frame_dataset \
-  --model_path_i checkpoints/cvpr2024_image.pth.tar \
-  --model_path_p checkpoints/cvpr2024_video.pth.tar \
-  --save_dir checkpoints/dcvcfm_satellite_curriculum/04_robust_curriculum \
-  --lr 6e-5 \
-  --lambda_channel 0.08 \
-  --max_steps 80000
-```
-
-Validation gate: `PLR=0.3` should remain recognizable without strong artifacts;
-`PLR=0.5` should fall back gracefully through the base layer.
-
-## Phase 5: Joint Finetune
-
-Goal: adapt selected DCVC-FM feature modulation, prior fusion, quantization
-scalers, and decoder layers with a small learning rate.
-
-Trainable parameters:
-
-- all adapter parameters;
-- `feature_adaptor*`;
-- contextual decoder and reconstruction generation;
-- temporal/y prior fusion modules;
-- quantization scaler parameters.
-
-Command:
-
-```bash
-python -m training.train_dcvcfm_satellite_curriculum \
-  --phase joint_finetune \
-  --channel_type satellite \
-  --resume checkpoints/dcvcfm_satellite_curriculum/04_robust_curriculum/best.pt \
-  --data_dir /path/to/frame_dataset \
-  --model_path_i checkpoints/cvpr2024_image.pth.tar \
-  --model_path_p checkpoints/cvpr2024_video.pth.tar \
-  --save_dir checkpoints/dcvcfm_satellite_curriculum/05_joint_finetune \
-  --lr 1e-5 \
-  --lambda_channel 0.05 \
-  --lambda_monotonic 0.25 \
-  --max_steps 30000
-```
-
-Validation gate: high-bandwidth clean quality should stay close to the pure
-DCVC-FM baseline, while bandwidth and PLR response should remain clear.
-
-## One-Command Run
-
-The helper script chains all phases and evaluates the final `best.pt`:
-
-```bash
-bash run_dcvcfm_satellite_curriculum.sh \
-  --data-root /path/to/frame_dataset \
+SLOT_STEPS=20 SELECTION_STEPS=20 CAPACITY_STEPS=20 ROBUST_STEPS=20 JOINT_STEPS=20 \
+bash run_dcvcfm_satellite_curriculum_8gpu.sh \
+  --data-root /data/sdb/bitqzh/data/BVI-DVC-512 \
   --model-i checkpoints/cvpr2024_image.pth.tar \
-  --model-p checkpoints/cvpr2024_video.pth.tar
+  --model-p checkpoints/cvpr2024_video.pth.tar \
+  --ngpu 1 \
+  --result-root results/dcvcfm_satellite_smoke
 ```
 
-You can override phase lengths through environment variables:
+成功后应看到：
 
-```bash
-SLOT_STEPS=1000 SELECTION_STEPS=2000 CAPACITY_STEPS=1000 ROBUST_STEPS=2000 JOINT_STEPS=1000 \
-bash run_dcvcfm_satellite_curriculum.sh --data-root /path/to/frame_dataset
+```text
+checkpoints/dcvcfm_satellite_curriculum/05_joint_finetune/best.pt
+results/dcvcfm_satellite_smoke/suite_summary.json
 ```
 
-## Formal Evaluation
+如果冒烟测试失败，先修错误，不要直接跑完整训练。
 
-Use `best.pt`, not `final.pt`, for the formal suite:
+## 5. 跑完整课程训练
+
+8 卡推荐命令：
 
 ```bash
-python -m training.evaluate_dcvcfm_satellite_suite \
-  --data_dir /path/to/frame_dataset/val \
+bash run_dcvcfm_satellite_curriculum_8gpu.sh \
+  --data-root /data/sdb/bitqzh/data/BVI-DVC-512 \
+  --model-i checkpoints/cvpr2024_image.pth.tar \
+  --model-p checkpoints/cvpr2024_video.pth.tar \
+  --ngpu 8 \
+  --result-root results/dcvcfm_satellite_curriculum
+```
+
+4 卡命令：
+
+```bash
+bash run_dcvcfm_satellite_curriculum_8gpu.sh \
+  --data-root /data/sdb/bitqzh/data/BVI-DVC-512 \
+  --model-i checkpoints/cvpr2024_image.pth.tar \
+  --model-p checkpoints/cvpr2024_video.pth.tar \
+  --ngpu 4 \
+  --result-root results/dcvcfm_satellite_curriculum
+```
+
+该脚本会按顺序自动运行：
+
+1. `baseline`：关闭卫星路径，检查 wrapper；
+2. `slot_warmup`：按 Slot Attention 官方 object discovery 范式预热；
+3. `selection_warmup`：identity channel 下训练语义 token selection；
+4. `capacity_calibration`：成对带宽训练，约束 bpp/keep ratio 单调；
+5. `robust_curriculum`：加入 satellite channel，训练 SNR/BW/PLR 鲁棒性；
+6. `joint_finetune`：小学习率解冻少量 DCVC-FM 后端模块；
+7. `evaluate_dcvcfm_satellite_suite`：用 `best.pt` 做正式测试。
+
+最终 checkpoint：
+
+```text
+checkpoints/dcvcfm_satellite_curriculum/05_joint_finetune/best.pt
+```
+
+不要用：
+
+```text
+final.pt
+```
+
+## 6. 单独重跑正式测试
+
+完整训练结束后，如果只想重新评估，不需要重训：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m training.evaluate_dcvcfm_satellite_suite \
+  --data_dir /data/sdb/bitqzh/data/BVI-DVC-512/test \
   --ckpt checkpoints/dcvcfm_satellite_curriculum/05_joint_finetune/best.pt \
   --model_path_i checkpoints/cvpr2024_image.pth.tar \
   --model_path_p checkpoints/cvpr2024_video.pth.tar \
   --channel_type satellite \
-  --output_dir results/dcvcfm_satellite_curriculum \
-  --disable_lpips \
-  --disable_dists
+  --img_h 512 \
+  --img_w 512 \
+  --clip_len 7 \
+  --batch_size 1 \
+  --num_workers 6 \
+  --output_dir results/dcvcfm_satellite_curriculum
 ```
 
-The suite evaluates:
+测试覆盖：
 
-- tiers: outage, poor, medium, good;
-- bandwidth scan: `1 / 2 / 5 / 10 / 20 / 25 Mbps`;
-- SNR scan: `1 / 5 / 10 / 15 / 20 dB`;
-- PLR scan: `0 / 0.05 / 0.1 / 0.2 / 0.3 / 0.5`.
+- tier scan：outage / poor / medium / good；
+- bandwidth scan：1 / 2 / 5 / 10 / 20 / 25 Mbps；
+- SNR scan：1 / 5 / 10 / 15 / 20 dB；
+- PLR scan：0 / 0.05 / 0.1 / 0.2 / 0.3 / 0.5。
 
-Output:
+输出主文件：
 
-- per-condition `eval_results.json`;
-- top-level `suite_summary.json`;
-- bandwidth diagnostics: monotonic violations and BW25/BW1 bpp ratio;
-- PLR diagnostics: quality trend and presence of `PLR=0.3/0.5` cases.
+```text
+results/dcvcfm_satellite_curriculum/suite_summary.json
+```
 
-Dry run:
+## 7. 结果检查顺序
+
+### 7.1 官方 baseline
+
+先看：
+
+```text
+results/bvidvc512_dcvcfm_official_rgb.json
+```
+
+确认所有 rate point 有结果，PSNR/bpp 正常。
+
+### 7.2 卫星模型总表
+
+再看：
+
+```text
+results/dcvcfm_satellite_curriculum/suite_summary.json
+```
+
+重点字段：
+
+```text
+diagnostics.bandwidth.bpp_monotonic_violations
+diagnostics.bandwidth.keep_monotonic_violations
+diagnostics.bandwidth.bpp_bw_max_over_min
+```
+
+要求：
+
+- `bpp_monotonic_violations` 为 0 或极少；
+- `keep_monotonic_violations` 为 0；
+- `bpp_bw_max_over_min > 2.5`。
+
+### 7.3 高带宽质量
+
+看：
+
+```text
+tiers/good
+bandwidth/bw_20
+bandwidth/bw_25
+```
+
+要求：
+
+- `SNR=20, BW=20/25, PLR=0` 时 PSNR 接近官方 DCVC-FM baseline；
+- 如果高带宽仍明显低，优先缩短 joint finetune 或降低 `lambda_monotonic`。
+
+### 7.4 低带宽降级
+
+看：
+
+```text
+bandwidth/bw_1
+bandwidth/bw_2
+```
+
+要求：
+
+- base layer ratio 有效；
+- enhancement layer ratio 明显低于高带宽；
+- 图像可识别，不应完全崩溃。
+
+### 7.5 PLR 鲁棒性
+
+看：
+
+```text
+plr/plr_0.3
+plr/plr_0.5
+```
+
+要求：
+
+- `PLR=0.3` 不严重花屏；
+- `PLR=0.5` 有 fallback 质量。
+
+## 8. 常见问题
+
+### 为什么还要运行 prepare 脚本？
+
+不是为了重新划分数据，而是为了给 DCVC-FM 官方 `test_video.py` 生成兼容 config，并创建 `im00001.png` 标准命名 symlink。卫星训练脚本直接读取原始 `train/test`，不依赖这个 symlink 目录。
+
+### 找不到 UVG 文件
+
+说明你误用了官方示例 config。不要再用：
+
+```text
+dataset_config_example_yuv420.json
+```
+
+应使用：
+
+```text
+/data/sdb/bitqzh/data/BVI-DVC-512_dcvcfm/configs/bvidvc512_rgb.json
+```
+
+### 显存不足
+
+优先降低训练裁剪尺寸，正式测试仍保持 512：
 
 ```bash
-python -m training.evaluate_dcvcfm_satellite_suite \
-  --data_dir /path/to/frame_dataset/val \
-  --dry_run \
-  --output_dir results/dcvcfm_satellite_curriculum_dryrun
+bash run_dcvcfm_satellite_curriculum_8gpu.sh \
+  --data-root /data/sdb/bitqzh/data/BVI-DVC-512 \
+  --ngpu 8 \
+  --train-img-h 192 \
+  --train-img-w 192
 ```
 
-## Acceptance Checks
+### 多卡卡住
 
-Use `results/dcvcfm_satellite_curriculum/suite_summary.json`.
+- 不要加 `--amp`；
+- 确认所有 GPU 进程都能访问 `/data/sdb/bitqzh/data/BVI-DVC-512`；
+- 主脚本已经使用 `torchrun --standalone`；
+- 同机多任务时设置 `CUDA_VISIBLE_DEVICES`。
 
-High-bandwidth quality:
+### 训练太慢
 
-- inspect `tiers/good` and bandwidth `bw_20`, `bw_25`;
-- PSNR should be close to the pure DCVC-FM baseline;
-- obvious collapse at `SNR=20`, `BW=20/25`, `PLR=0` means the adapter is too
-  aggressive or joint fine-tune overfit to rate reduction.
-
-Bandwidth response:
-
-- `diagnostics.bandwidth.bpp_monotonic_violations` should be `0` or very small;
-- `diagnostics.bandwidth.keep_monotonic_violations` should be `0`;
-- `diagnostics.bandwidth.bpp_bw_max_over_min` should ideally be `> 2.5`;
-- PSNR should generally rise with bandwidth.
-
-Low-bandwidth graceful degradation:
-
-- `bw_1` and `bw_2` should mainly use base latents;
-- reconstruction may be lower quality, but should remain recognizable.
-
-Satellite robustness:
-
-- PLR `0.3` should avoid severe artifacts;
-- PLR `0.5` should preserve fallback/base-layer structure.
-
-## Notes
-
-- `train_dcvcfm_satellite_curriculum.py` saves the initialized model as
-  `best.pt` before training updates, so early degradation cannot erase the
-  starting baseline.
-- AMP is opt-in with `--amp`; fp32 is the default because DCVC-FM entropy/bit
-  estimation can be numerically sensitive.
-- The selector uses straight-through top-k: hard masks in the forward pass and
-  soft relaxation in the backward pass. Slot and selector parameters therefore
-  receive gradients from reconstruction and rate losses.
-- The current latent dropping is a research proxy over decoded latents, not a
-  finalized entropy-coded base/enhancement bitstream format.
+- 编译 motion compensation CUDA 扩展；
+- 使用 `--ngpu 8`；
+- `--num-workers 6` 或 `8`；
+- 确保数据在本地 SSD/NVMe。

@@ -455,7 +455,15 @@ def main() -> None:
     (save_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
 
     train_root = Path(args.data_dir) / "train" if (Path(args.data_dir) / "train").exists() else Path(args.data_dir)
-    val_root = Path(args.val_dir) if args.val_dir else (Path(args.data_dir) / "val")
+    data_root_for_val = Path(args.data_dir)
+    if args.val_dir:
+        val_root = Path(args.val_dir)
+    elif (data_root_for_val / "val").exists():
+        val_root = data_root_for_val / "val"
+    elif (data_root_for_val / "test").exists():
+        val_root = data_root_for_val / "test"
+    else:
+        val_root = data_root_for_val / "val"
     train_ds = VideoFolderDataset(
         train_root,
         clip_len=args.clip_len,

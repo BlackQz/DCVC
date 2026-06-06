@@ -111,10 +111,9 @@ This repository also includes an optional satellite-channel training and
 evaluation wrapper under `src/models/satellite/`. It keeps the original DCVC-FM
 codec and bitstream path intact, while adding Slot Attention, continuous
 capacity control, base/enhancement latent selection, and satellite channel
-simulation for research experiments. See
-[`docs/dcvcfm_satellite.md`](docs/dcvcfm_satellite.md) for the model wrapper
-and [`docs/dcvcfm_satellite_training_plan.md`](docs/dcvcfm_satellite_training_plan.md)
-for the recommended curriculum training and formal evaluation plan.
+simulation for research experiments. The canonical BVI-DVC 512 Ubuntu/8-GPU
+training and evaluation plan is
+[`docs/dcvcfm_satellite_training_plan.md`](docs/dcvcfm_satellite_training_plan.md).
 
 # Comparing with other method
 Bit saving over VTM-17.0 (HEVC E (600 frames) with single intra-frame setting (i.e. intra-period = –1) and YUV420 colorspace.)
