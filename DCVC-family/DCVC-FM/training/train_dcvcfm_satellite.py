@@ -38,7 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.satellite import SatelliteDCVCFM, rate_budget_interval_loss  # noqa: E402
+from src.models.satellite import SatelliteDCVCFM, q_index_proxy_loss, rate_budget_interval_loss  # noqa: E402
 from src.models.satellite.losses import (  # noqa: E402
     reconstruction_distortion,
     slot_reconstruction_loss,
@@ -218,6 +218,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> SatelliteDCVC
         slot_iterations=args.slot_iterations,
         slot_adapter_resolution=(args.slot_adapter_h, args.slot_adapter_w),
         update_slots_on_p=not args.no_update_slots_on_p,
+        enable_slot_modulation=args.enable_slot_modulation,
         controller_kwargs={
             "min_capacity_mbps": args.min_capacity_mbps,
             "max_capacity_mbps": args.max_capacity_mbps,
@@ -233,6 +234,10 @@ def build_model(args: argparse.Namespace, device: torch.device) -> SatelliteDCVC
             "keep_gamma": args.keep_gamma,
             "q_index_low_capacity": args.q_index_low_capacity,
             "q_index_high_capacity": args.q_index_high_capacity,
+            "q_index_mode": args.q_index_mode,
+            "q_rd_table_path": args.q_rd_table_path,
+            "q_delta_max": args.q_delta_max,
+            "q_mlp_hidden": args.q_mlp_hidden,
             "lambda_rate_over": args.capacity_lambda_rate_over,
             "lambda_rate_under": args.capacity_lambda_rate_under,
             "learnable_offsets": not args.disable_learnable_capacity_offsets,
@@ -304,14 +309,17 @@ def compute_training_loss(
     )
     rate_losses = []
     token_losses = []
+    q_losses = []
     for frame in out["frames"]:
         if frame.frame_type != "P" or frame.control is None:
             continue
         rate_loss, _ = rate_budget_interval_loss(frame.bpp, frame.control)
         rate_losses.append(rate_loss)
         token_losses.append(token_selection_regularization(frame.selection, frame.control))
+        q_losses.append(q_index_proxy_loss(frame.control, delta_weight=args.q_delta_reg_weight))
     rate_budget = torch.stack(rate_losses).mean() if rate_losses else recon.new_tensor(0.0)
     token_reg = torch.stack(token_losses).mean() if token_losses else recon.new_tensor(0.0)
+    q_reg = torch.stack(q_losses).mean() if q_losses else recon.new_tensor(0.0)
     temporal = recon.new_tensor(0.0)
     for idx in range(1, clip.shape[1]):
         temporal = temporal + temporal_consistency_loss(
@@ -336,6 +344,7 @@ def compute_training_loss(
         + args.lambda_rate_budget * rate_budget
         + args.lambda_temporal * temporal
         + args.lambda_token * token_reg
+        + args.lambda_q_index * q_reg
         + args.lambda_slot_recon * slot_recon
     )
     logs = {
@@ -346,12 +355,18 @@ def compute_training_loss(
         "weighted_rate": float((args.lambda_rate_budget * rate_budget).detach().cpu().item()),
         "temporal": float(temporal.detach().cpu().item()),
         "token": float(token_reg.detach().cpu().item()),
+        "q_index_loss": float(q_reg.detach().cpu().item()),
+        "weighted_q_index": float((args.lambda_q_index * q_reg).detach().cpu().item()),
         "slot_recon": float(slot_recon.detach().cpu().item()),
         "psnr": compute_psnr(recon, clip),
         "ssim": compute_ssim_torch(recon, clip),
         "bpp": mean_frame_metric(out["frames"], "bpp"),
         "target_bpp": mean_frame_metric(out["frames"], "target_bpp"),
         "capacity": mean_frame_metric(out["frames"], "capacity_mbps"),
+        "q_index": mean_frame_metric(out["frames"], "q_index"),
+        "q_index_base": mean_frame_metric(out["frames"], "q_index_base"),
+        "q_index_delta": mean_frame_metric(out["frames"], "q_index_delta"),
+        "q_proxy_bpp": mean_frame_metric(out["frames"], "q_proxy_bpp"),
         "keep": mean_frame_metric(out["frames"], "keep_ratio"),
         "base": mean_frame_metric(out["frames"], "base_layer_ratio"),
         "enh": mean_frame_metric(out["frames"], "enhancement_layer_ratio"),
@@ -396,6 +411,9 @@ def validate(
                 "bpp": mean_frame_metric(out["frames"], "bpp"),
                 "target_bpp": mean_frame_metric(out["frames"], "target_bpp"),
                 "capacity": mean_frame_metric(out["frames"], "capacity_mbps"),
+                "q_index": mean_frame_metric(out["frames"], "q_index"),
+                "q_index_base": mean_frame_metric(out["frames"], "q_index_base"),
+                "q_index_delta": mean_frame_metric(out["frames"], "q_index_delta"),
                 "keep_ratio": mean_frame_metric(out["frames"], "keep_ratio"),
                 "base_layer_ratio": mean_frame_metric(out["frames"], "base_layer_ratio"),
                 "enhancement_layer_ratio": mean_frame_metric(out["frames"], "enhancement_layer_ratio"),
@@ -546,7 +564,8 @@ def main() -> None:
                 LOGGER.info(
                     "step=%d loss=%.4f recon=%.4f weighted_rate=%.4f slot=%.4f "
                     "PSNR=%.2f SSIM=%.4f actual_bpp=%.4f target_bpp=%.4f "
-                    "capacity=%.2f keep=%.3f base=%.3f enh=%.3f tx=%.2fms proc=%.2fms step=%.1fms",
+                    "capacity=%.2f q=%.1f q_base=%.1f q_delta=%.2f keep=%.3f "
+                    "base=%.3f enh=%.3f tx=%.2fms proc=%.2fms step=%.1fms",
                     global_step,
                     logs["loss"],
                     logs["weighted_recon"],
@@ -557,6 +576,9 @@ def main() -> None:
                     logs["bpp"],
                     logs["target_bpp"],
                     logs["capacity"],
+                    logs["q_index"],
+                    logs["q_index_base"],
+                    logs["q_index_delta"],
                     logs["keep"],
                     logs["base"],
                     logs["enh"],
@@ -569,15 +591,17 @@ def main() -> None:
                 score, summary = validate(model, val_loader, conditions=conditions, args=args, device=device)
                 for item in summary["conditions"]:
                     LOGGER.info(
-                        "val SNR=%.1f BW=%.1f PLR=%.2f PSNR=%.2f SSIM=%.4f bpp=%.4f keep=%.3f target=%.4f",
+                        "val SNR=%.1f BW=%.1f PLR=%.2f PSNR=%.2f SSIM=%.4f bpp=%.4f "
+                        "target=%.4f q=%.1f keep=%.3f",
                         item["snr_db"],
                         item["bandwidth_mbps"],
                         item["packet_loss_rate"],
                         item.get("PSNR", 0.0),
                         item.get("SSIM", 0.0),
                         item.get("bpp", 0.0),
-                        item.get("keep_ratio", 0.0),
                         item.get("target_bpp", 0.0),
+                        item.get("q_index", 0.0),
+                        item.get("keep_ratio", 0.0),
                     )
                 if score < best_score:
                     best_score = score
@@ -657,6 +681,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slot_adapter_h", type=int, default=128)
     p.add_argument("--slot_adapter_w", type=int, default=128)
     p.add_argument("--no_update_slots_on_p", action="store_true")
+    p.set_defaults(enable_slot_modulation=True)
+    p.add_argument("--enable_slot_modulation", dest="enable_slot_modulation", action="store_true",
+                   help="Slot->decoder FiLM modulation (on by default, matches the curriculum trainer)")
+    p.add_argument("--disable_slot_modulation", dest="enable_slot_modulation", action="store_false",
+                   help="ablation: turn off Slot->decoder FiLM modulation")
     p.add_argument("--w_mag", type=float, default=0.45)
     p.add_argument("--w_novelty", type=float, default=0.25)
     p.add_argument("--w_obj", type=float, default=0.20)
@@ -676,9 +705,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep_gamma", type=float, default=0.85)
     p.add_argument("--q_index_low_capacity", type=float, default=0.0)
     p.add_argument("--q_index_high_capacity", type=float, default=63.0)
+    p.add_argument("--q_index_mode", type=str, default="rd_table", choices=["linear", "rd_table"],
+                   help="rd_table requires --q_rd_table_path (no silent fallback to linear)")
+    p.add_argument("--q_rd_table_path", type=str, default="")
+    p.add_argument("--q_delta_max", type=float, default=0.0)
+    p.add_argument("--q_mlp_hidden", type=int, default=32)
     p.add_argument("--capacity_lambda_rate_over", type=float, default=1.0)
     p.add_argument("--capacity_lambda_rate_under", type=float, default=0.35)
+    p.set_defaults(disable_learnable_capacity_offsets=True)
     p.add_argument("--disable_learnable_capacity_offsets", action="store_true")
+    p.add_argument("--learnable_capacity_offsets", dest="disable_learnable_capacity_offsets", action="store_false")
     p.add_argument("--no_row_packet_loss", action="store_true")
     p.add_argument("--base_snr_gain_db", type=float, default=6.0)
     p.add_argument("--enhancement_snr_gain_db", type=float, default=0.0)
@@ -696,9 +732,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_recon", type=float, default=1.0)
     p.add_argument("--lambda_mse", type=float, default=1.0)
     p.add_argument("--lambda_l1", type=float, default=0.05)
-    p.add_argument("--lambda_rate_budget", type=float, default=1.0)
+    # Rate is owned by the deterministic q_index path; the rate-budget interval
+    # loss is OFF by default (kept tunable for ablation only).
+    p.add_argument("--lambda_rate_budget", type=float, default=0.0)
     p.add_argument("--lambda_temporal", type=float, default=0.05)
     p.add_argument("--lambda_token", type=float, default=0.05)
+    p.add_argument("--lambda_q_index", type=float, default=0.0)
+    p.add_argument("--q_delta_reg_weight", type=float, default=0.02)
     p.add_argument("--lambda_slot_recon", type=float, default=0.1,
                    help="weight for the Slot Attention object-discovery reconstruction loss")
     return p.parse_args()

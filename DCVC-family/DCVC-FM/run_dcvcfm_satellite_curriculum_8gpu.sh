@@ -25,6 +25,9 @@ EVAL_IMG_W=512
 BATCH_SIZE=1
 NUM_WORKERS=6
 NGPU="${NGPU:-8}"
+Q_INDEX_MODE="rd_table"
+Q_RD_TABLE=""
+Q_DELTA_MAX=0.0
 
 # 这些是“单卡等效总步数”。脚本会自动除以 NGPU，让 8 卡看到的总样本量接近单卡设置。
 SLOT_STEPS="${SLOT_STEPS:-30000}"
@@ -49,6 +52,9 @@ while [[ $# -gt 0 ]]; do
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --num-workers) NUM_WORKERS="$2"; shift 2 ;;
     --ngpu) NGPU="$2"; shift 2 ;;
+    --q-index-mode) Q_INDEX_MODE="$2"; shift 2 ;;
+    --q-rd-table) Q_RD_TABLE="$2"; Q_INDEX_MODE="rd_table"; shift 2 ;;
+    --q-delta-max) Q_DELTA_MAX="$2"; shift 2 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
@@ -60,6 +66,14 @@ fi
 
 if [[ "$NGPU" -lt 1 || "$NGPU" -gt 8 ]]; then
   echo "NGPU 必须在 1 到 8 之间，当前为 $NGPU" >&2
+  exit 2
+fi
+
+# RD 表是默认主码率策略。没有表时直接报错（不静默退回 linear）。
+if [[ "$Q_INDEX_MODE" == "rd_table" && -z "$Q_RD_TABLE" ]]; then
+  echo "错误: q_index_mode=rd_table 但未提供 RD 表。" >&2
+  echo "  请先用 tools/build_qindex_rd_table.py 生成表，再加 --q-rd-table <path>；" >&2
+  echo "  或显式指定 --q-index-mode linear 使用线性映射。" >&2
   exit 2
 fi
 
@@ -87,6 +101,7 @@ ADAPTER_DECAY=$(scale_steps 60000)
 echo "[DCVC-FM-SAT] NGPU=$NGPU per-rank steps: slot=$SLOT_S selection=$SEL_S capacity=$CAP_S robust=$ROB_S joint=$JOINT_S"
 echo "[DCVC-FM-SAT] checkpoints: $OUT_ROOT"
 echo "[DCVC-FM-SAT] train crop: ${TRAIN_IMG_H}x${TRAIN_IMG_W}; eval frame: ${EVAL_IMG_H}x${EVAL_IMG_W}"
+echo "[DCVC-FM-SAT] q control: mode=$Q_INDEX_MODE rd_table=${Q_RD_TABLE:-none} delta_max=$Q_DELTA_MAX"
 if [[ -d "$DATA_ROOT/val" ]]; then
   EVAL_DATA_DIR="$DATA_ROOT/val"
 elif [[ -d "$DATA_ROOT/test" ]]; then
@@ -112,6 +127,9 @@ COMMON=(
   --batch_size "$BATCH_SIZE"
   --num_workers "$NUM_WORKERS"
   --val_conditions "12,10,0.0;5,10,0.0;12,10,0.2;10,2,0.0;20,18,0.0;5,2,0.1"
+  --q_index_mode "$Q_INDEX_MODE"
+  --q_rd_table_path "$Q_RD_TABLE"
+  --q_delta_max "$Q_DELTA_MAX"
 )
 
 # 0. 纯 DCVC-FM wrapper 基线。只验证路径，不训练。
@@ -135,12 +153,14 @@ COMMON=(
   --lr_decay_rate 0.5 \
   --max_steps "$SLOT_S"
 
-# 2. 语义选择预热。冻结 DCVC-FM，identity channel，先把 selector/capacity 学活。
+# 2. 适配器预热。冻结 DCVC-FM + 冻结 Slot，identity channel 下训练
+#    Slot->decoder FiLM 调制器（吃重建梯度）。q_index 已是确定性码率主旋钮，
+#    带宽响应天然单调，无需单独的容量校准阶段。
 "${LAUNCH[@]}" "${COMMON[@]}" \
   --phase selection_warmup \
   --channel_type identity \
   --resume "$OUT_ROOT/01_slot_warmup/best.pt" \
-  --save_dir "$OUT_ROOT/02_selection_warmup" \
+  --save_dir "$OUT_ROOT/02_adapt_warmup" \
   --clip_len 5 \
   --lr 1e-4 \
   --lr_warmup_steps "$ADAPTER_WARMUP" \
@@ -148,25 +168,12 @@ COMMON=(
   --lr_decay_rate 0.7 \
   --max_steps "$SEL_S"
 
-# 3. 连续容量校准。成对带宽 + 单调性损失，直接解决“所有带宽都省码率”。
-"${LAUNCH[@]}" "${COMMON[@]}" \
-  --phase capacity_calibration \
-  --channel_type identity \
-  --resume "$OUT_ROOT/02_selection_warmup/best.pt" \
-  --save_dir "$OUT_ROOT/03_capacity_calibration" \
-  --clip_len 5 \
-  --lr 8e-5 \
-  --lr_warmup_steps "$ADAPTER_WARMUP" \
-  --lr_decay_steps "$ADAPTER_DECAY" \
-  --lr_decay_rate 0.7 \
-  --lambda_monotonic 0.5 \
-  --max_steps "$CAP_S"
-
-# 4. 卫星信道鲁棒课程。引入周期 intra 和更长 clip，贴近 DCVC-FM 多帧级联训练。
+# 3. 卫星信道鲁棒课程。此阶段才真正训练 token 选择器（base/enhancement 不等差错
+#    保护只在有噪/丢包时影响重建）。引入周期 intra 和更长 clip，贴近多帧级联。
 "${LAUNCH[@]}" "${COMMON[@]}" \
   --phase robust_curriculum \
   --channel_type satellite \
-  --resume "$OUT_ROOT/03_capacity_calibration/best.pt" \
+  --resume "$OUT_ROOT/02_adapt_warmup/best.pt" \
   --save_dir "$OUT_ROOT/04_robust_curriculum" \
   --clip_len 7 \
   --intra_period 8 \
@@ -174,7 +181,7 @@ COMMON=(
   --lr_warmup_steps "$ADAPTER_WARMUP" \
   --lr_decay_steps "$ADAPTER_DECAY" \
   --lr_decay_rate 0.7 \
-  --lambda_channel 0.08 \
+  --lambda_channel 0.03 \
   --max_steps "$ROB_S"
 
 # 5. 小学习率联合微调。只解冻 DCVC-FM 的后端调制/先验融合/decoder 相关模块。
@@ -189,7 +196,7 @@ COMMON=(
   --lr_warmup_steps "$ADAPTER_WARMUP" \
   --lr_decay_steps "$ADAPTER_DECAY" \
   --lr_decay_rate 0.8 \
-  --lambda_channel 0.05 \
+  --lambda_channel 0.02 \
   --lambda_monotonic 0.25 \
   --max_steps "$JOINT_S"
 
@@ -206,6 +213,9 @@ CUDA_VISIBLE_DEVICES=0 python -m training.evaluate_dcvcfm_satellite_suite \
   --batch_size 1 \
   --num_workers "$NUM_WORKERS" \
   --channel_type satellite \
+  --q_index_mode "$Q_INDEX_MODE" \
+  --q_rd_table_path "$Q_RD_TABLE" \
+  --q_delta_max "$Q_DELTA_MAX" \
   --output_dir "$RESULT_ROOT"
 
 echo "[DCVC-FM-SAT] 全部阶段完成。正式 checkpoint: $OUT_ROOT/05_joint_finetune/best.pt"

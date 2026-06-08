@@ -47,6 +47,10 @@ def flatten_summary(summary: dict[str, Any], *, label: str, suite: str, snr: flo
         "bpp": _mean(summary, "rate", "bpp"),
         "kbps": _mean(summary, "rate", "kbps"),
         "target_bpp": _mean(summary, "rate", "target_bpp"),
+        "q_index": _mean(summary, "rate", "q_index"),
+        "q_index_base": _mean(summary, "rate", "q_index_base"),
+        "q_index_delta": _mean(summary, "rate", "q_index_delta"),
+        "q_proxy_bpp": _mean(summary, "rate", "q_proxy_bpp"),
         "keep_ratio": _mean(summary, "rate", "keep_ratio"),
         "base_layer_ratio": _mean(summary, "rate", "base_layer_ratio"),
         "enhancement_layer_ratio": _mean(summary, "rate", "enhancement_layer_ratio"),
@@ -216,6 +220,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slot_adapter_h", type=int, default=128)
     p.add_argument("--slot_adapter_w", type=int, default=128)
     p.add_argument("--no_update_slots_on_p", action="store_true")
+    p.set_defaults(enable_slot_modulation=True)
+    p.add_argument("--enable_slot_modulation", dest="enable_slot_modulation", action="store_true",
+                   help="Slot->decoder FiLM modulation (on by default, matches training)")
+    p.add_argument("--disable_slot_modulation", dest="enable_slot_modulation", action="store_false",
+                   help="ablation: evaluate without Slot->decoder FiLM modulation")
 
     p.add_argument("--q_index_i", type=int, default=63)
     p.add_argument("--q_index_p", type=int, default=63)
@@ -237,8 +246,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep_gamma", type=float, default=0.85)
     p.add_argument("--q_index_low_capacity", type=float, default=0.0)
     p.add_argument("--q_index_high_capacity", type=float, default=63.0)
+    p.add_argument("--q_index_mode", type=str, default="rd_table", choices=["linear", "rd_table"],
+                   help="must match training; rd_table requires --q_rd_table_path (no silent fallback)")
+    p.add_argument("--q_rd_table_path", type=str, default="")
+    p.add_argument("--q_delta_max", type=float, default=0.0)
+    p.add_argument("--q_mlp_hidden", type=int, default=32)
     p.add_argument("--ste_temperature", type=float, default=0.08)
+    p.set_defaults(disable_learnable_capacity_offsets=True)
     p.add_argument("--disable_learnable_capacity_offsets", action="store_true")
+    p.add_argument("--learnable_capacity_offsets", dest="disable_learnable_capacity_offsets", action="store_false")
 
     p.add_argument("--no_row_packet_loss", action="store_true")
     p.add_argument("--base_snr_gain_db", type=float, default=6.0)

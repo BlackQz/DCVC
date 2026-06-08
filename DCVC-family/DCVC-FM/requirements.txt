@@ -1,8 +1,40 @@
-numpy>=1.20.0
-scipy
-matplotlib
+# DCVC-FM + satellite-aware adapter runtime dependencies.
+#
+# Recommended Ubuntu/Page1 setup:
+#   sudo apt-get update
+#   sudo apt-get install -y cmake g++ ninja-build
+#   conda create -n Page1 python=3.10
+#   conda activate Page1
+#   conda install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0 pytorch-cuda=11.8 -c pytorch -c nvidia
+#   pip install -r requirements.txt
+#
+# Keep the PyTorch lines below for pip-only environments.  If PyTorch was
+# installed by conda as above, pip will treat the installed versions as already
+# satisfied and will not replace them.
+
 torch>=2.0.0
-tensorboard
-tqdm
-bd-metric
-ptflops
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+numpy>=1.23,<2.0
+scipy>=1.9.0
+Pillow>=9.4.0
+matplotlib>=3.5.0
+tqdm>=4.64.0
+tensorboard>=2.10.0
+
+# Official DCVC-FM reporting / model-size helpers.
+bd-metric>=0.9.0
+ptflops>=0.7.0
+
+# Optional perceptual metrics used by training/evaluate_dcvcfm_satellite.py.
+# The evaluator degrades gracefully when these packages are missing, but install
+# them for formal LPIPS/DISTS reporting.
+lpips>=0.1.4
+DISTS-pytorch>=0.1
+
+# CUDA extension build helpers for src/models/extensions/setup.py.
+ninja>=1.11.0
+packaging>=23.0
+setuptools>=65.0
+wheel>=0.38.0

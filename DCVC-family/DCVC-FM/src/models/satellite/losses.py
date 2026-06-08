@@ -42,11 +42,21 @@ def token_selection_regularization(
     selection: SelectionOutput | None,
     control: CapacityControl,
 ) -> torch.Tensor:
+    """Constrain the protected base-layer occupancy, not the rate.
+
+    Under the decoupled design every latent position is transmitted (total keep
+    == 1) and the rate is set by q_index.  The selector's only budget is how big
+    the protected base layer is, so we regularize the (differentiable) expected
+    base ratio toward the controller's channel-driven base_keep target.  Which
+    positions land in the base layer is learned from the reconstruction loss
+    under channel corruption, so this term does not fight distortion.
+    """
+
     if selection is None:
-        return control.target_bpp.new_tensor(0.0)
-    keep = selection.expected_keep_ratio.to(control.total_keep_ratio.dtype)
-    target = control.total_keep_ratio.to(keep.device)
-    return F.smooth_l1_loss(keep, target)
+        return control.base_keep_ratio.new_tensor(0.0)
+    base = selection.expected_base_ratio.to(control.base_keep_ratio.dtype)
+    target = control.base_keep_ratio.to(base.device)
+    return F.smooth_l1_loss(base, target)
 
 
 def channel_robustness_loss(

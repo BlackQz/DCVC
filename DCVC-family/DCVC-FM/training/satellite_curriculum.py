@@ -26,7 +26,7 @@ from src.models.satellite.losses import (
     temporal_consistency_loss,
     token_selection_regularization,
 )
-from src.models.satellite.capacity_controller import rate_budget_interval_loss
+from src.models.satellite.capacity_controller import q_index_proxy_loss, rate_budget_interval_loss
 
 
 PHASES = (
@@ -145,7 +145,9 @@ def configure_trainable_parameters(model: SatelliteDCVCFM, phase: str) -> list[n
         for param in model.slot_adapter.parameters():
             param.requires_grad = True
     elif spec.name in {"selection_warmup", "capacity_calibration", "robust_curriculum"}:
-        model.freeze_dcvcfm_backbone()
+        # Slot Attention is warmed up once, then kept fixed so the selector sees
+        # stable object maps instead of chasing a moving semantic representation.
+        model.freeze_dcvcfm_backbone(train_slot_adapter=False)
     elif spec.name == "joint_finetune":
         model.unfreeze_stage_c()
     else:  # pragma: no cover - guarded by get_phase_spec
@@ -266,25 +268,30 @@ def slot_temporal_stability_loss(slot_outputs: list[SlotAdapterOutput]) -> torch
 
 def differentiable_p_frame_losses(
     frame_outputs: list[FrameForwardOutput],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return mean rate-budget, token-regularization, and monotonic losses."""
+    *,
+    q_delta_reg_weight: float = 0.02,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return mean rate-budget, token, monotonic, and q-controller losses."""
 
     rate_losses = []
     token_losses = []
+    q_losses = []
     for frame in frame_outputs:
         if frame.frame_type != "P" or frame.control is None:
             continue
         rate_loss, _ = rate_budget_interval_loss(frame.bpp, frame.control)
         rate_losses.append(rate_loss)
         token_losses.append(token_selection_regularization(frame.selection, frame.control))
+        q_losses.append(q_index_proxy_loss(frame.control, delta_weight=q_delta_reg_weight))
     if not rate_losses:
         ref = frame_outputs[0].x_hat if frame_outputs else torch.tensor(0.0)
         zero = ref.new_tensor(0.0)
-        return zero, zero, zero
+        return zero, zero, zero, zero
     rate = torch.stack(rate_losses).mean()
     token = torch.stack(token_losses).mean()
+    q_loss = torch.stack(q_losses).mean()
     mono = bandwidth_monotonic_loss(frame_outputs)
-    return rate, token, mono
+    return rate, token, mono, q_loss
 
 
 def bandwidth_monotonic_loss(
@@ -346,10 +353,14 @@ def compute_satellite_sequence_loss(
         q_index_p=None if args.capacity_q_index else args.q_index_p,
         intra_period=args.intra_period,
         enable_satellite=enable_satellite,
+        i_frame_capacity_q=args.capacity_q_index,
     )
     recon = out["x_hat"].clamp(0.0, 1.0)
     recon_loss = reconstruction_distortion(recon, clip, mse_weight=args.lambda_mse, l1_weight=args.lambda_l1)
-    rate_loss, token_loss, mono_loss = differentiable_p_frame_losses(out["frames"])
+    rate_loss, token_loss, mono_loss, q_loss = differentiable_p_frame_losses(
+        out["frames"],
+        q_delta_reg_weight=args.q_delta_reg_weight,
+    )
     temporal = temporal_sequence_loss(recon, clip)
 
     channel_loss = recon.new_tensor(0.0)
@@ -364,6 +375,7 @@ def compute_satellite_sequence_loss(
                 q_index_p=None if args.capacity_q_index else args.q_index_p,
                 intra_period=args.intra_period,
                 enable_satellite=False,
+                i_frame_capacity_q=args.capacity_q_index,
             )["x_hat"].clamp(0.0, 1.0)
         channel_loss = channel_robustness_loss(clean, recon)
 
@@ -371,6 +383,7 @@ def compute_satellite_sequence_loss(
         args.lambda_recon * recon_loss
         + args.lambda_rate_budget * rate_loss
         + args.lambda_token * token_loss
+        + args.lambda_q_index * q_loss
         + args.lambda_temporal * temporal
         + args.lambda_monotonic * mono_loss
         + args.lambda_channel * channel_loss
@@ -383,12 +396,18 @@ def compute_satellite_sequence_loss(
         "rate_budget": float(rate_loss.detach().cpu().item()),
         "weighted_rate": float((args.lambda_rate_budget * rate_loss).detach().cpu().item()),
         "token": float(token_loss.detach().cpu().item()),
+        "q_index_loss": float(q_loss.detach().cpu().item()),
+        "weighted_q_index": float((args.lambda_q_index * q_loss).detach().cpu().item()),
         "temporal": float(temporal.detach().cpu().item()),
         "monotonic": float(mono_loss.detach().cpu().item()),
         "channel": float(channel_loss.detach().cpu().item()),
         "bpp": float(metrics.get("bpp", 0.0)),
         "target_bpp": float(metrics.get("target_bpp", 0.0)),
         "capacity": float(metrics.get("capacity_mbps", 0.0)),
+        "q_index": float(metrics.get("q_index", 0.0)),
+        "q_index_base": float(metrics.get("q_index_base", 0.0)),
+        "q_index_delta": float(metrics.get("q_index_delta", 0.0)),
+        "q_proxy_bpp": float(metrics.get("q_proxy_bpp", 0.0)),
         "keep": float(metrics.get("keep_ratio", 0.0)),
         "base": float(metrics.get("base_layer_ratio", 0.0)),
         "enh": float(metrics.get("enhancement_layer_ratio", 0.0)),
@@ -404,6 +423,7 @@ def bandwidth_scan_diagnostics(items: list[dict[str, Any]]) -> dict[str, Any]:
     ordered = sorted(items, key=lambda item: float(item["bandwidth_mbps"]))
     bpps = [float(item.get("bpp", 0.0)) for item in ordered]
     keeps = [float(item.get("keep_ratio", 0.0)) for item in ordered]
+    q_indexes = [float(item.get("q_index", 0.0)) for item in ordered]
     psnrs = [float(item.get("PSNR", 0.0)) for item in ordered]
     bws = [float(item["bandwidth_mbps"]) for item in ordered]
 
@@ -417,14 +437,17 @@ def bandwidth_scan_diagnostics(items: list[dict[str, Any]]) -> dict[str, Any]:
         "bandwidth_mbps": bws,
         "bpp": bpps,
         "keep_ratio": keeps,
+        "q_index": q_indexes,
         "PSNR": psnrs,
         "bpp_monotonic_violations": violations(bpps),
         "keep_monotonic_violations": violations(keeps),
+        "q_index_monotonic_violations": violations(q_indexes),
         "psnr_monotonic_violations": violations(psnrs),
         "bpp_bw_max_over_min": ratio,
         "passes_bw_response_gate": bool(
             violations(bpps) == 0
             and violations(keeps) == 0
+            and violations(q_indexes) == 0
             and ratio is not None
             and ratio >= 2.5
         ),

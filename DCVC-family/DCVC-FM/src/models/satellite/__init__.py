@@ -1,6 +1,11 @@
 """Satellite-aware adapters for DCVC-FM."""
 
-from .capacity_controller import CapacityControl, ContinuousCapacityController, rate_budget_interval_loss
+from .capacity_controller import (
+    CapacityControl,
+    ContinuousCapacityController,
+    q_index_proxy_loss,
+    rate_budget_interval_loss,
+)
 from .channel import LayeredSatelliteChannel
 from .dcvc_fm_satellite import FrameForwardOutput, SatelliteDCVCFM, SatelliteForwardState
 from .losses import (
@@ -16,6 +21,7 @@ from .token_selector import SatelliteTokenSelector, SelectionOutput
 __all__ = [
     "CapacityControl",
     "ContinuousCapacityController",
+    "q_index_proxy_loss",
     "rate_budget_interval_loss",
     "LayeredSatelliteChannel",
     "FrameForwardOutput",

@@ -106,15 +106,17 @@ def set_phase_defaults(args: argparse.Namespace) -> None:
     if args.channel_type == "auto":
         args.channel_type = spec.channel_type_hint
     if args.phase == "slot_warmup":
+        # Slot warm-up is pure object discovery: no rate/channel/selection terms.
         args.lambda_rate_budget = 0.0
         args.lambda_token = 0.0
         args.lambda_monotonic = 0.0
         args.lambda_channel = 0.0
     elif args.phase == "capacity_calibration":
-        args.lambda_monotonic = max(args.lambda_monotonic, 0.25)
+        # Deprecated phase kept for ablation only; channel teacher stays off here.
         args.lambda_channel = 0.0
-    elif args.phase in {"robust_curriculum", "joint_finetune"}:
-        args.lambda_channel = max(args.lambda_channel, 0.05)
+    # robust_curriculum / joint_finetune: respect the exact --lambda_channel passed
+    # on the command line (no hidden floor), so the channel-teacher weight can be
+    # tuned down to reduce coupling / training difficulty as intended.
 
 
 def update_learning_rate(optimizer: torch.optim.Optimizer, args: argparse.Namespace, step: int) -> float:
@@ -297,15 +299,17 @@ def prepare_clip_and_conditions(
 def log_validation_summary(summary: dict[str, Any]) -> None:
     for item in summary.get("conditions", []):
         LOGGER.info(
-            "val SNR=%.1f BW=%.1f PLR=%.2f PSNR=%.2f SSIM=%.4f bpp=%.4f keep=%.3f target=%.4f",
+            "val SNR=%.1f BW=%.1f PLR=%.2f PSNR=%.2f SSIM=%.4f bpp=%.4f "
+            "target=%.4f q=%.1f keep=%.3f",
             item["snr_db"],
             item["bandwidth_mbps"],
             item["packet_loss_rate"],
             item.get("PSNR", 0.0),
             item.get("SSIM", 0.0),
             item.get("bpp", 0.0),
-            item.get("keep_ratio", 0.0),
             item.get("target_bpp", 0.0),
+            item.get("q_index", 0.0),
+            item.get("keep_ratio", 0.0),
         )
     if "slot_validation" in summary:
         item = summary["slot_validation"]
@@ -458,7 +462,8 @@ def train(args: argparse.Namespace) -> None:
                 LOGGER.info(
                     "phase=%s step=%d loss=%.5f recon=%.5f rate=%.5f mono=%.5f ch=%.5f "
                     "PSNR=%.2f SSIM=%.4f actual_bpp=%.4f target_bpp=%.4f capacity=%.2f "
-                    "keep=%.3f base=%.3f enh=%.3f tx=%.2fms proc=%.2fms step=%.1fms",
+                    "q=%.1f q_base=%.1f q_delta=%.2f keep=%.3f base=%.3f enh=%.3f "
+                    "tx=%.2fms proc=%.2fms step=%.1fms",
                     args.phase,
                     global_step,
                     logs.get("loss", 0.0),
@@ -471,6 +476,9 @@ def train(args: argparse.Namespace) -> None:
                     logs.get("bpp", 0.0),
                     logs.get("target_bpp", 0.0),
                     logs.get("capacity", 0.0),
+                    logs.get("q_index", 0.0),
+                    logs.get("q_index_base", 0.0),
+                    logs.get("q_index_delta", 0.0),
                     logs.get("keep", 0.0),
                     logs.get("base", 0.0),
                     logs.get("enh", 0.0),
@@ -597,6 +605,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slot_adapter_w", type=int, default=128)
     p.add_argument("--slot_frames_per_clip", type=int, default=0)
     p.add_argument("--no_update_slots_on_p", action="store_true")
+    p.set_defaults(enable_slot_modulation=True)
+    p.add_argument("--enable_slot_modulation", dest="enable_slot_modulation", action="store_true",
+                   help="Slot FiLM modulation of the decoded latent (key innovation); on by default")
+    p.add_argument("--disable_slot_modulation", dest="enable_slot_modulation", action="store_false",
+                   help="ablation: turn off Slot->decoder FiLM modulation")
 
     p.add_argument("--w_mag", type=float, default=0.45)
     p.add_argument("--w_novelty", type=float, default=0.25)
@@ -618,9 +631,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep_gamma", type=float, default=0.85)
     p.add_argument("--q_index_low_capacity", type=float, default=0.0)
     p.add_argument("--q_index_high_capacity", type=float, default=63.0)
+    p.add_argument("--q_index_mode", type=str, default="rd_table", choices=["linear", "rd_table"],
+                   help="primary rate knob: capacity->q_index via offline RD table (falls back to linear if no table)")
+    p.add_argument("--q_rd_table_path", type=str, default="")
+    p.add_argument("--q_delta_max", type=float, default=0.0)
+    p.add_argument("--q_mlp_hidden", type=int, default=32)
     p.add_argument("--capacity_lambda_rate_over", type=float, default=1.0)
     p.add_argument("--capacity_lambda_rate_under", type=float, default=0.35)
+    p.set_defaults(disable_learnable_capacity_offsets=True)
     p.add_argument("--disable_learnable_capacity_offsets", action="store_true")
+    p.add_argument("--learnable_capacity_offsets", dest="disable_learnable_capacity_offsets", action="store_false")
 
     p.add_argument("--no_row_packet_loss", action="store_true")
     p.add_argument("--base_snr_gain_db", type=float, default=6.0)
@@ -640,9 +660,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_recon", type=float, default=1.0)
     p.add_argument("--lambda_mse", type=float, default=1.0)
     p.add_argument("--lambda_l1", type=float, default=0.05)
-    p.add_argument("--lambda_rate_budget", type=float, default=1.0)
+    # Rate is owned by the deterministic q_index path, so the rate-budget interval
+    # loss is OFF by default (set >0 only as a soft safety guard if ever needed).
+    p.add_argument("--lambda_rate_budget", type=float, default=0.0)
     p.add_argument("--lambda_temporal", type=float, default=0.05)
     p.add_argument("--lambda_token", type=float, default=0.05)
+    p.add_argument("--lambda_q_index", type=float, default=0.0)
+    p.add_argument("--q_delta_reg_weight", type=float, default=0.02)
     p.add_argument("--lambda_monotonic", type=float, default=0.0)
     p.add_argument("--lambda_channel", type=float, default=0.0)
     p.add_argument("--lambda_slot", type=float, default=1.0)

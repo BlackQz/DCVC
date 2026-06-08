@@ -122,6 +122,7 @@ class SatelliteDCVCFM(nn.Module):
         slot_iterations: int = 3,
         slot_adapter_resolution: tuple[int, int] = (128, 128),
         update_slots_on_p: bool = True,
+        enable_slot_modulation: bool = True,
         eval_noisy: bool = True,
         controller_kwargs: dict[str, Any] | None = None,
         selector_kwargs: dict[str, Any] | None = None,
@@ -145,6 +146,19 @@ class SatelliteDCVCFM(nn.Module):
         channel_args.setdefault("eval_noisy", eval_noisy)
         self.channel = LayeredSatelliteChannel(**channel_args)
         self.update_slots_on_p = bool(update_slots_on_p)
+        self.enable_slot_modulation = bool(enable_slot_modulation)
+
+    def _adapter_modules(self, *, train_slot_adapter: bool = True) -> tuple[nn.Module, ...]:
+        modules: list[nn.Module] = [
+            self.token_selector,
+            self.capacity_controller,
+            self.channel,
+        ]
+        if train_slot_adapter:
+            modules.insert(0, self.slot_adapter)
+        if self.enable_slot_modulation:
+            modules.append(self.slot_y_modulator)
+        return tuple(modules)
 
     @classmethod
     def from_pretrained(
@@ -172,20 +186,23 @@ class SatelliteDCVCFM(nn.Module):
             "ref_mv_y": None,
         }
 
-    def freeze_dcvcfm_backbone(self) -> None:
+    def freeze_dcvcfm_backbone(self, *, train_slot_adapter: bool = True) -> None:
         for param in self.i_frame_net.parameters():
             param.requires_grad = False
         for param in self.p_frame_net.parameters():
             param.requires_grad = False
-        for module in (self.slot_adapter, self.token_selector, self.capacity_controller,
-                       self.channel, self.slot_y_modulator):
+        for param in self.slot_adapter.parameters():
+            param.requires_grad = False
+        for param in self.slot_y_modulator.parameters():
+            param.requires_grad = False
+        for module in self._adapter_modules(train_slot_adapter=train_slot_adapter):
             for param in module.parameters():
                 param.requires_grad = True
 
     def unfreeze_stage_c(self) -> None:
         """Unfreeze conservative DCVC-FM parts for small-LR joint tuning."""
 
-        self.freeze_dcvcfm_backbone()
+        self.freeze_dcvcfm_backbone(train_slot_adapter=False)
         names = (
             "feature_adaptor_I",
             "feature_adaptor",
@@ -219,9 +236,8 @@ class SatelliteDCVCFM(nn.Module):
                 for param in module_or_param.parameters():
                     param.requires_grad = True
 
-    def adapter_parameters(self):
-        for module in (self.slot_adapter, self.token_selector, self.capacity_controller,
-                       self.channel, self.slot_y_modulator):
+    def adapter_parameters(self, *, train_slot_adapter: bool = True):
+        for module in self._adapter_modules(train_slot_adapter=train_slot_adapter):
             yield from module.parameters()
 
     def _build_control(
@@ -246,7 +262,7 @@ class SatelliteDCVCFM(nn.Module):
     def _control_q_index(control: CapacityControl, fallback: int | None) -> int | list[int]:
         if fallback is not None:
             return int(fallback)
-        q = control.q_index.detach().to(torch.float32).round().clamp(0, DMC.get_qp_num() - 1)
+        q = control.q_index_rounded.detach().to(torch.float32).clamp(0, DMC.get_qp_num() - 1)
         q_list = [int(v) for v in q.cpu().tolist()]
         return q_list[0] if len(q_list) == 1 else q_list
 
@@ -285,6 +301,10 @@ class SatelliteDCVCFM(nn.Module):
             "enhancement_layer_ratio": 0.0,
             "target_bpp": _tensor_mean_float(control.target_bpp) if control is not None else 0.0,
             "capacity_mbps": _tensor_mean_float(control.capacity_mbps) if control is not None else 0.0,
+            "q_index": float(q_index),
+            "q_index_base": _tensor_mean_float(control.q_index_base) if control is not None else float(q_index),
+            "q_index_delta": _tensor_mean_float(control.q_index_residual) if control is not None else 0.0,
+            "q_proxy_bpp": _tensor_mean_float(control.q_index_proxy_bpp) if control is not None else 0.0,
             "tx_time_ms": 0.0,
         }
         return FrameForwardOutput(
@@ -372,7 +392,10 @@ class SatelliteDCVCFM(nn.Module):
 
         mv_object = None
         if state.slot is not None:
-            mv_object = state.slot.object_importance
+            # Detach: the object map is a stable saliency prior for selection only.
+            # Slot learning is supervised separately (warm-up reconstruction) and
+            # via the decoder FiLM path, never through the selector.
+            mv_object = state.slot.object_importance.detach()
         if enable_satellite:
             mv_y_rx, mv_selection = self._select_and_transmit(
                 mv_y_hat,
@@ -405,7 +428,7 @@ class SatelliteDCVCFM(nn.Module):
         slot_latent_object = None
         if state.slot is not None:
             slot_latent_object = F.interpolate(
-                state.slot.object_importance,
+                state.slot.object_importance.detach(),
                 size=y_hat.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
@@ -420,8 +443,13 @@ class SatelliteDCVCFM(nn.Module):
                 temporal_uncertainty=scales_hat,
                 enable_satellite=True,
             )
-            if state.slot is not None:
-                y_rx = self.slot_y_modulator(y_rx, state.slot.slots)
+            if self.enable_slot_modulation and state.slot is not None:
+                # Semantic (slot) conditioning of the decoded latent: applied AFTER
+                # the channel so it only shapes reconstruction/error-concealment and
+                # never changes the transmitted rate.  Slots are detached (frozen
+                # prior); only the FiLM modulator's own parameters are trained, so
+                # this path is decoupled from both slot learning and token selection.
+                y_rx = self.slot_y_modulator(y_rx, state.slot.slots.detach())
         else:
             y_rx, selection = y_hat, None
 
@@ -436,10 +464,12 @@ class SatelliteDCVCFM(nn.Module):
             bits_mv_y = p.get_y_laplace_bits(mv_y_q.float(), mv_scales_hat.float())
             bits_z = p.get_z_bits(z_hat.float(), p.bit_estimator_z, index)
             bits_mv_z = p.get_z_bits(mv_z_hat.float(), p.bit_estimator_z_mv, index)
-        if selection is not None:
-            bits_y = bits_y * selection.keep_mask.float()
-        if mv_selection is not None:
-            bits_mv_y = bits_mv_y * mv_selection.keep_mask.float()
+        # Rate is owned solely by the original DCVC-FM q_index path: every latent
+        # position is coded/transmitted, so the bit count is the native codec rate
+        # at the selected q_index.  Token selection is a pure error-protection
+        # partition (base vs enhancement) handled inside the channel and therefore
+        # must NOT scale the bit estimate, otherwise it becomes a second, coupled
+        # rate knob that fights q_index.
         bpp_y = torch.sum(bits_y, dim=(1, 2, 3)) / pixel_num
         bpp_mv_y = torch.sum(bits_mv_y, dim=(1, 2, 3)) / pixel_num
         bpp_z = torch.sum(bits_z, dim=(1, 2, 3)) / pixel_num
@@ -480,6 +510,10 @@ class SatelliteDCVCFM(nn.Module):
             "capacity_mbps": _tensor_mean_float(control.capacity_mbps),
             "capacity_norm": _tensor_mean_float(control.capacity_norm),
             "q_index": float(sum(q_idx) / len(q_idx)) if isinstance(q_idx, list) else float(q_idx),
+            "q_index_cont": _tensor_mean_float(control.q_index),
+            "q_index_base": _tensor_mean_float(control.q_index_base),
+            "q_index_delta": _tensor_mean_float(control.q_index_residual),
+            "q_proxy_bpp": _tensor_mean_float(control.q_index_proxy_bpp),
             "proc_time_ms": proc_ms,
             "tx_time_ms": _tensor_mean_float(tx_ms),
         }
@@ -508,6 +542,7 @@ class SatelliteDCVCFM(nn.Module):
         intra_period: int = 9999,
         rate_gop_size: int = 8,
         enable_satellite: bool = True,
+        i_frame_capacity_q: bool = True,
     ) -> dict[str, Any]:
         if frames.ndim != 5:
             raise ValueError(f"frames must be (B,T,C,H,W), got {tuple(frames.shape)}")
@@ -528,7 +563,15 @@ class SatelliteDCVCFM(nn.Module):
             x = frames_proc[:, frame_idx]
             if frame_idx % intra_period == 0 or state is None:
                 control = self._build_control(x, snr_db=snr, bandwidth_mbps=bw, packet_loss_rate=plr)
-                out = self.forward_i_frame(x, q_index=q_index_i, control=control)
+                # Let the I-frame rate follow the same capacity->q_index mapping as
+                # the P-frames so high bandwidth yields a high-quality anchor and
+                # low bandwidth does not pay for a max-rate intra frame.
+                if i_frame_capacity_q:
+                    qd = self._control_q_index(control, None)
+                    i_q = qd if isinstance(qd, int) else int(round(sum(qd) / len(qd)))
+                else:
+                    i_q = q_index_i
+                out = self.forward_i_frame(x, q_index=i_q, control=control)
             else:
                 fa_idx = index_map[frame_idx % rate_gop_size]
                 out = self.forward_p_frame(

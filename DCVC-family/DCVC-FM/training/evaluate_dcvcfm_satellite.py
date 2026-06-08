@@ -131,6 +131,7 @@ def load_model(args: argparse.Namespace, device: torch.device) -> SatelliteDCVCF
         slot_iterations=args.slot_iterations,
         slot_adapter_resolution=(args.slot_adapter_h, args.slot_adapter_w),
         update_slots_on_p=not args.no_update_slots_on_p,
+        enable_slot_modulation=args.enable_slot_modulation,
         controller_kwargs={
             "min_capacity_mbps": args.min_capacity_mbps,
             "max_capacity_mbps": args.max_capacity_mbps,
@@ -146,6 +147,10 @@ def load_model(args: argparse.Namespace, device: torch.device) -> SatelliteDCVCF
             "keep_gamma": args.keep_gamma,
             "q_index_low_capacity": args.q_index_low_capacity,
             "q_index_high_capacity": args.q_index_high_capacity,
+            "q_index_mode": args.q_index_mode,
+            "q_rd_table_path": args.q_rd_table_path,
+            "q_delta_max": args.q_delta_max,
+            "q_mlp_hidden": args.q_mlp_hidden,
             "learnable_offsets": not args.disable_learnable_capacity_offsets,
         },
         selector_kwargs={
@@ -208,6 +213,10 @@ def evaluate(args: argparse.Namespace) -> dict:
     tx_values: list[float] = []
     target_bpp_values: list[float] = []
     capacity_values: list[float] = []
+    q_index_values: list[float] = []
+    q_base_values: list[float] = []
+    q_delta_values: list[float] = []
+    q_proxy_bpp_values: list[float] = []
     per_gop = []
     total_frames = 0
 
@@ -249,6 +258,10 @@ def evaluate(args: argparse.Namespace) -> dict:
             "enhancement_layer_ratio": safe_mean(flatten_frame_metrics(frames, "enhancement_layer_ratio")),
             "target_bpp": safe_mean(flatten_frame_metrics(frames, "target_bpp")),
             "capacity_mbps": safe_mean(flatten_frame_metrics(frames, "capacity_mbps")),
+            "q_index": safe_mean(flatten_frame_metrics(frames, "q_index")),
+            "q_index_base": safe_mean(flatten_frame_metrics(frames, "q_index_base")),
+            "q_index_delta": safe_mean(flatten_frame_metrics(frames, "q_index_delta")),
+            "q_proxy_bpp": safe_mean(flatten_frame_metrics(frames, "q_proxy_bpp")),
             "proc_time_ms": safe_mean(flatten_frame_metrics(frames, "proc_time_ms")),
             "tx_time_ms": safe_mean(flatten_frame_metrics(frames, "tx_time_ms")),
             "num_frames": int(clip.shape[1] * clip.shape[0]),
@@ -266,16 +279,21 @@ def evaluate(args: argparse.Namespace) -> dict:
         enhancement_values.append(gop_metrics["enhancement_layer_ratio"])
         target_bpp_values.append(gop_metrics["target_bpp"])
         capacity_values.append(gop_metrics["capacity_mbps"])
+        q_index_values.append(gop_metrics["q_index"])
+        q_base_values.append(gop_metrics["q_index_base"])
+        q_delta_values.append(gop_metrics["q_index_delta"])
+        q_proxy_bpp_values.append(gop_metrics["q_proxy_bpp"])
         proc_values.append(gop_metrics["proc_time_ms"])
         tx_values.append(gop_metrics["tx_time_ms"])
         total_frames += gop_metrics["num_frames"]
 
         LOGGER.info(
-            "GoP %d PSNR=%.2f SSIM=%.4f bpp=%.4f keep=%.3f base=%.3f enh=%.3f",
+            "GoP %d PSNR=%.2f SSIM=%.4f bpp=%.4f q=%.1f keep=%.3f base=%.3f enh=%.3f",
             gop_idx,
             psnr,
             ssim,
             bpp,
+            gop_metrics["q_index"],
             gop_metrics["keep_ratio"],
             gop_metrics["base_layer_ratio"],
             gop_metrics["enhancement_layer_ratio"],
@@ -307,6 +325,10 @@ def evaluate(args: argparse.Namespace) -> dict:
             "bpp": metric_stats(bpp_values),
             "kbps": metric_stats(kbps_values),
             "target_bpp": metric_stats(target_bpp_values),
+            "q_index": metric_stats(q_index_values),
+            "q_index_base": metric_stats(q_base_values),
+            "q_index_delta": metric_stats(q_delta_values),
+            "q_proxy_bpp": metric_stats(q_proxy_bpp_values),
             "keep_ratio": metric_stats(keep_values),
             "base_layer_ratio": metric_stats(base_values),
             "enhancement_layer_ratio": metric_stats(enhancement_values),
@@ -358,6 +380,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slot_adapter_h", type=int, default=128)
     p.add_argument("--slot_adapter_w", type=int, default=128)
     p.add_argument("--no_update_slots_on_p", action="store_true")
+    p.set_defaults(enable_slot_modulation=True)
+    p.add_argument("--enable_slot_modulation", dest="enable_slot_modulation", action="store_true",
+                   help="Slot->decoder FiLM modulation (on by default, matches training)")
+    p.add_argument("--disable_slot_modulation", dest="enable_slot_modulation", action="store_false",
+                   help="ablation: evaluate without Slot->decoder FiLM modulation")
     p.add_argument("--q_index_i", type=int, default=63)
     p.add_argument("--q_index_p", type=int, default=63)
     p.add_argument("--min_capacity_mbps", type=float, default=0.5)
@@ -374,8 +401,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep_gamma", type=float, default=0.85)
     p.add_argument("--q_index_low_capacity", type=float, default=0.0)
     p.add_argument("--q_index_high_capacity", type=float, default=63.0)
+    p.add_argument("--q_index_mode", type=str, default="rd_table", choices=["linear", "rd_table"],
+                   help="must match training; rd_table requires --q_rd_table_path (no silent fallback)")
+    p.add_argument("--q_rd_table_path", type=str, default="")
+    p.add_argument("--q_delta_max", type=float, default=0.0)
+    p.add_argument("--q_mlp_hidden", type=int, default=32)
     p.add_argument("--ste_temperature", type=float, default=0.08)
+    p.set_defaults(disable_learnable_capacity_offsets=True)
     p.add_argument("--disable_learnable_capacity_offsets", action="store_true")
+    p.add_argument("--learnable_capacity_offsets", dest="disable_learnable_capacity_offsets", action="store_false")
     p.set_defaults(capacity_q_index=True)
     p.add_argument("--fixed_q_index", dest="capacity_q_index", action="store_false")
     p.add_argument("--intra_period", type=int, default=9999)
